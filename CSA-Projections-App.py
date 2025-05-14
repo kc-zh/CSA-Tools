@@ -1,0 +1,210 @@
+import streamlit as st
+import pandas as pd
+import openpyxl
+from io import BytesIO
+import os
+
+# --- Constants & Setup ---
+
+UPLOAD_DIR = "uploaded_files"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# Load ZIP-to-State map from saved .xlsm file with specific columns:
+def load_zip_to_state_map():
+    saved_files = os.listdir(UPLOAD_DIR)
+    if not saved_files:
+        st.warning("No ZIP code files uploaded yet. Please upload your ZIP code .xlsm file below.")
+        return None
+
+    selected_file = st.selectbox("Select ZIP code .xlsm file for ZIP-to-State mapping", saved_files)
+    file_path = os.path.join(UPLOAD_DIR, selected_file)
+
+    try:
+        # Read the .xlsm file, expect columns 'Zip Code' and 'Official State Name'
+        df = pd.read_excel(file_path, dtype={"Zip Code": str})
+        required_cols = ['Zip Code', 'Official State Name']
+        for col in required_cols:
+            if col not in df.columns:
+                st.error(f"The selected ZIP code file must have a '{col}' column.")
+                return None
+        # Create mapping dict from 'Zip Code' to 'Official State Name'
+        zip_to_state = dict(zip(df['Zip Code'].str.zfill(5), df['Official State Name']))
+        st.success(f"Loaded ZIP-to-State mapping from {selected_file}")
+        return zip_to_state
+    except Exception as e:
+        st.error(f"Error reading ZIP code file: {e}")
+        return None
+
+def get_state_from_zip(zip_code, zip_to_state):
+    if not zip_code or not zip_to_state:
+        return "Unknown"
+    return zip_to_state.get(str(zip_code).zfill(5), "Unknown")
+
+def generate_state_summary(census_df, zip_to_state):
+    # Format dates
+    for col in census_df.columns:
+        if 'date' in col.lower():
+            census_df[col] = pd.to_datetime(census_df[col], errors='coerce').dt.strftime('%m/%d/%Y')
+
+    # Relationship replacements
+    if 'Relationship' in census_df.columns:
+        census_df['Relationship'] = census_df['Relationship'].replace({
+            "E": "Employee", "EE": "Employee",
+            "C": "Child", "CH": "Child",
+            "S": "Spouse", "SP": "Spouse",
+            "Domestic Partner": "Spouse"
+        })
+
+    # Enrollment status replacements
+    if 'Status' in census_df.columns:
+        census_df['Status'] = census_df['Status'].replace({
+            "Enrolled": "Enroll", "Waived": "Waive",
+            "W": "Waive", "E": "Enroll"
+        })
+
+    # Find ZIP column
+    zip_col_candidates = ['Zip', 'ZIP', 'zip', 'ZipCode', 'zip_code', 'Zip Code']
+    zip_col = None
+    for col in zip_col_candidates:
+        if col in census_df.columns:
+            zip_col = col
+            break
+
+    if zip_col is None:
+        st.error("No ZIP code column found in census data.")
+        return None, None
+
+    census_df['State'] = census_df[zip_col].astype(str).apply(lambda z: get_state_from_zip(z, zip_to_state))
+
+    # Count lives per state
+    state_counts = census_df['State'].value_counts().to_dict()
+
+    def service_entity(state):
+        if state in ["Wisconsin", "Minnesota", "Colorado", "Massachusetts"]:
+            return "zizzl"
+        elif state == "Florida":
+            return "NHP"
+        else:
+            return "TWG"
+
+    summary_rows = []
+    for state, count in state_counts.items():
+        summary_rows.append({
+            "State": state,
+            "Number of Lives": count,
+            "Service Entity": service_entity(state)
+        })
+
+    summary_df = pd.DataFrame(summary_rows)
+
+    return summary_df, census_df
+
+def pipeline_update(state_summary_df, pipeline_path, new_or_match, prospect_name, match_name=None):
+    wb = openpyxl.load_workbook(pipeline_path)
+    ws = wb["Pipeline Test"]
+
+    last_row = ws.max_row
+
+    if new_or_match == "New":
+        target_row = last_row + 1 if last_row >= 4 else 4
+        name_to_write = prospect_name
+    else:
+        target_row = None
+        for row in ws.iter_rows(min_row=1, max_col=1, max_row=ws.max_row):
+            cell = row[0]
+            if cell.value == match_name:
+                target_row = cell.row
+                break
+        if target_row is None:
+            st.error("Prospect name to match not found in pipeline.")
+            return False
+        name_to_write = match_name
+
+    ws.cell(row=target_row, column=1).value = name_to_write
+    state_names_str = ", ".join(state_summary_df['State'].tolist())
+    ws.cell(row=target_row, column=2).value = state_names_str
+    total_lives = state_summary_df["Number of Lives"].sum()
+    ws.cell(row=target_row, column=8).value = total_lives
+
+    def sum_by_entity(entity):
+        return state_summary_df.loc[state_summary_df["Service Entity"] == entity, "Number of Lives"].sum()
+
+    ws.cell(row=target_row, column=13).value = sum_by_entity("zizzl")
+    ws.cell(row=target_row, column=14).value = sum_by_entity("TWG")
+    ws.cell(row=target_row, column=15).value = sum_by_entity("NHP")
+
+    wb.save(pipeline_path)
+    return True
+
+# --- Streamlit UI ---
+
+st.title("Census Data Formatting + State Summary + Pipeline Update Tool")
+
+# Upload ZIP code .xlsm for persistent ZIP-to-State mapping
+st.header("Step 0: Upload ZIP Code XLSM File")
+uploaded_zip_file = st.file_uploader("Upload ZIP code .xlsm file (must contain 'Zip Code' and 'Official State Name' columns)", type=["xlsm"])
+if uploaded_zip_file is not None:
+    save_path = os.path.join(UPLOAD_DIR, uploaded_zip_file.name)
+    if not os.path.exists(save_path):
+        with open(save_path, "wb") as f:
+            f.write(uploaded_zip_file.getbuffer())
+        st.success(f"Saved ZIP code file: {uploaded_zip_file.name}")
+    else:
+        st.info(f"ZIP code file '{uploaded_zip_file.name}' already exists.")
+
+# Load ZIP to state map from saved file
+zip_to_state_map = load_zip_to_state_map()
+if zip_to_state_map is None:
+    st.stop()
+
+# Upload census CSV file
+st.header("Step 1: Upload Census CSV File")
+uploaded_census = st.file_uploader("Upload Census CSV file", type=["csv"])
+if uploaded_census:
+    census_df = pd.read_csv(uploaded_census, dtype=str)
+    with st.spinner("Processing census data..."):
+        state_summary_df, formatted_census_df = generate_state_summary(census_df, zip_to_state_map)
+
+    if state_summary_df is not None:
+        st.subheader("State Summary")
+        st.dataframe(state_summary_df)
+
+        st.subheader("Formatted Census Data Preview")
+        st.dataframe(formatted_census_df.head(20))
+
+        towrite = BytesIO()
+        with pd.ExcelWriter(towrite, engine='openpyxl') as writer:
+            state_summary_df.to_excel(writer, sheet_name="State Summary", index=False)
+            formatted_census_df.to_excel(writer, sheet_name="Formatted Census", index=False)
+        towrite.seek(0)
+        st.download_button("Download Summary & Formatted Census Excel", data=towrite,
+                           file_name="StateSummary.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+        # Pipeline update
+        st.header("Step 2: Pipeline Update")
+        pipeline_file = st.file_uploader("Upload Pipeline Excel file (with 'Pipeline Test' sheet)", type=["xlsm", "xlsx"])
+        if pipeline_file:
+            pipeline_path = "./temp_pipeline.xlsx"
+            with open(pipeline_path, "wb") as f:
+                f.write(pipeline_file.read())
+
+            action = st.radio("Choose Prospect Action", options=["New", "Match"])
+            if action == "New":
+                new_name = st.text_input("Enter New Prospect Name")
+                if new_name:
+                    if st.button("Update Pipeline with New Prospect"):
+                        success = pipeline_update(state_summary_df, pipeline_path, "New", new_name)
+                        if success:
+                            st.success("Pipeline updated with new prospect!")
+                            with open(pipeline_path, "rb") as f:
+                                st.download_button("Download Updated Pipeline Excel", f, file_name="Updated_Pipeline.xlsx")
+            else:
+                match_name = st.text_input("Enter Prospect Name to Match")
+                if match_name:
+                    if st.button("Update Pipeline with Matched Prospect"):
+                        success = pipeline_update(state_summary_df, pipeline_path, "Match", None, match_name)
+                        if success:
+                            st.success("Pipeline updated with matched prospect!")
+                            with open(pipeline_path, "rb") as f:
+                                st.download_button("Download Updated Pipeline Excel", f, file_name="Updated_Pipeline.xlsx")
