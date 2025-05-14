@@ -1,0 +1,409 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import io
+import base64
+from datetime import datetime
+import re
+import os
+import requests
+from io import BytesIO
+
+st.set_page_config(page_title="Census File Processor", layout="wide")
+
+st.title("Census File Processor")
+st.write("This app replicates the functionality of the Format2CSA VBA macro for processing census files.")
+
+# Function to generate comprehensive fallback ZIP code data
+def generate_fallback_zip_data():
+    """Generate comprehensive fallback ZIP code data for all states"""
+    # Create a dictionary of state ZIP code ranges based on common first digits
+    state_zip_ranges = {
+        "Alabama": {"ranges": [(35000, 36999)]},
+        "Alaska": {"ranges": [(99500, 99999)]},
+        "Arizona": {"ranges": [(85000, 86999)]},
+        "Arkansas": {"ranges": [(71600, 72999)]},
+        "California": {"ranges": [(90000, 96699)]},
+        "Colorado": {"ranges": [(80000, 81699)]},
+        "Connecticut": {"ranges": [(6000, 6999)]},
+        "Delaware": {"ranges": [(19700, 19999)]},
+        "District of Columbia": {"ranges": [(20000, 20599)]},
+        "Florida": {"ranges": [(32000, 34999)]},
+        "Georgia": {"ranges": [(30000, 31999), (39800, 39999)]},
+        "Hawaii": {"ranges": [(96700, 96899)]},
+        "Idaho": {"ranges": [(83200, 83999)]},
+        "Illinois": {"ranges": [(60000, 62999)]},
+        "Indiana": {"ranges": [(46000, 47999)]},
+        "Iowa": {"ranges": [(50000, 52999)]},
+        "Kansas": {"ranges": [(66000, 67999)]},
+        "Kentucky": {"ranges": [(40000, 42799)]},
+        "Louisiana": {"ranges": [(70000, 71599)]},
+        "Maine": {"ranges": [(3900, 4999)]},
+        "Maryland": {"ranges": [(20600, 21999)]},
+        "Massachusetts": {"ranges": [(1000, 2799)]},
+        "Michigan": {"ranges": [(48000, 49999)]},
+        "Minnesota": {"ranges": [(55000, 56799)]},
+        "Mississippi": {"ranges": [(38600, 39799)]},
+        "Missouri": {"ranges": [(63000, 65899)]},
+        "Montana": {"ranges": [(59000, 59999)]},
+        "Nebraska": {"ranges": [(68000, 69399)]},
+        "Nevada": {"ranges": [(88900, 89999)]},
+        "New Hampshire": {"ranges": [(3000, 3899)]},
+        "New Jersey": {"ranges": [(7000, 8999)]},
+        "New Mexico": {"ranges": [(87000, 88499)]},
+        "New York": {"ranges": [(10000, 14999), (0, 999), (501, 544)]},
+        "North Carolina": {"ranges": [(27000, 28999)]},
+        "North Dakota": {"ranges": [(58000, 58999)]},
+        "Ohio": {"ranges": [(43000, 45999)]},
+        "Oklahoma": {"ranges": [(73000, 74999)]},
+        "Oregon": {"ranges": [(97000, 97999)]},
+        "Pennsylvania": {"ranges": [(15000, 19699)]},
+        "Rhode Island": {"ranges": [(2800, 2999)]},
+        "South Carolina": {"ranges": [(29000, 29999)]},
+        "South Dakota": {"ranges": [(57000, 57999)]},
+        "Tennessee": {"ranges": [(37000, 38599)]},
+        "Texas": {"ranges": [(75000, 79999), (88500, 88599)]},
+        "Utah": {"ranges": [(84000, 84999)]},
+        "Vermont": {"ranges": [(5000, 5999)]},
+        "Virginia": {"ranges": [(22000, 24699)]},
+        "Washington": {"ranges": [(98000, 99499)]},
+        "West Virginia": {"ranges": [(24700, 26999)]},
+        "Wisconsin": {"ranges": [(53000, 54999)]},
+        "Wyoming": {"ranges": [(82000, 83199)]}
+    }
+    
+    zip_to_state = {}
+    
+    # Generate ZIP codes for each state based on ranges
+    for state, data in state_zip_ranges.items():
+        for start, end in data["ranges"]:
+            # For each range, create a sampling of ZIP codes (for efficiency)
+            # For important states (mentioned in the VBA), create more samples
+            if state in ["Wisconsin", "Minnesota", "Colorado", "Massachusetts", "Florida"]:
+                step = max(1, (end - start) // 500)  # More detailed for key states
+            else:
+                step = max(1, (end - start) // 50)  # Fewer samples for other states
+            
+            for zip_code in range(start, end + 1, step):
+                zip_to_state[str(zip_code).zfill(5)] = state
+    
+    # Add some specific important ZIP codes for the key states
+    key_zips = {
+        "Wisconsin": ["53201", "53202", "53203", "53204", "53205", "53206", "53207", "53208", "53209", "53210"],
+        "Minnesota": ["55101", "55102", "55103", "55104", "55105", "55106", "55107", "55108", "55109", "55110"],
+        "Colorado": ["80201", "80202", "80203", "80204", "80205", "80206", "80207", "80208", "80209", "80210"],
+        "Massachusetts": ["02101", "02102", "02103", "02104", "02105", "02106", "02107", "02108", "02109", "02110"],
+        "Florida": ["33010", "33011", "33012", "33013", "33014", "33015", "33016", "33017", "33018", "33019"]
+    }
+    
+    for state, zips in key_zips.items():
+        for zip_code in zips:
+            zip_to_state[zip_code] = state
+            
+    return zip_to_state
+
+# First ask for ZIP code data
+st.sidebar.header("ZIP Code Data")
+zip_data_option = st.sidebar.radio(
+    "Choose ZIP code data source:",
+    ["Use Built-in ZIP Database", "Upload Custom ZIP Code File (.csv or .xlsx/.xlsm)"]
+)
+
+# Initialize zip_to_state
+zip_to_state = {}
+
+if zip_data_option == "Use Built-in ZIP Database":
+    # Use the fallback data
+    zip_to_state = generate_fallback_zip_data()
+    st.sidebar.success(f"Using built-in ZIP code database with {len(zip_to_state)} mappings")
+else:
+    # Allow user to upload their own ZIP code file
+    custom_zip_data = st.sidebar.file_uploader(
+        "Upload ZIP Code File", 
+        type=["csv", "xlsx", "xlsm"],
+        help="Upload a file with ZIP code to state mappings"
+    )
+    
+    if custom_zip_data:
+        try:
+            # Check file extension
+            file_ext = custom_zip_data.name.split('.')[-1].lower()
+            
+            if file_ext in ['xlsx', 'xlsm']:
+                # For Excel files
+                df_zip = pd.read_excel(custom_zip_data, sheet_name="ZipCodes")
+            else:
+                # For CSV files
+                df_zip = pd.read_csv(custom_zip_data)
+            
+            # Display the first few rows to help user verify the data
+            st.sidebar.write("Preview of ZIP code data:")
+            st.sidebar.dataframe(df_zip.head(3))
+            
+            # Get column names from the dataframe
+            zip_col = st.sidebar.selectbox("Select ZIP code column:", df_zip.columns)
+            state_col = st.sidebar.selectbox("Select state column:", df_zip.columns)
+            
+            if st.sidebar.button("Confirm ZIP Code Mapping"):
+                # Create mapping dictionary
+                custom_zip_to_state = dict(zip(df_zip[zip_col].astype(str).str.zfill(5), df_zip[state_col]))
+                zip_to_state = custom_zip_to_state
+                st.sidebar.success(f"Loaded {len(custom_zip_to_state)} custom ZIP code mappings")
+        except Exception as e:
+            st.sidebar.error(f"Error loading ZIP code data: {str(e)}")
+            # Fall back to the generated data
+            zip_to_state = generate_fallback_zip_data()
+            st.sidebar.warning(f"Using fallback ZIP code database with {len(zip_to_state)} mappings")
+    else:
+        # No file uploaded, use fallback
+        zip_to_state = generate_fallback_zip_data()
+        st.sidebar.info("Upload your ZIP code file or use the built-in database")
+
+# Function to get state from ZIP code
+def get_state_from_zip(zip_code, zip_dict):
+    """
+    Get state name from ZIP code using the provided dictionary
+    """
+    if not zip_code or not isinstance(zip_code, str):
+        return "Unknown"
+    
+    # Ensure ZIP code is a 5-digit string
+    zip_code = str(zip_code).strip().zfill(5)
+    
+    # Look up the state
+    if zip_code in zip_dict:
+        return zip_dict[zip_code]
+    else:
+        return "Unknown"
+
+# Function to generate state summary based on processed data
+def generate_state_summary(df, zip_dict):
+    """
+    Generate a summary of states, number of lives, and service entity
+    """
+    state_counts = {}
+    
+    # Get the ZIP code column (column L, index 11)
+    if len(df.columns) > 11:
+        # Process each row
+        for _, row in df.iterrows():
+            # Get ZIP code from column L
+            zip_code = row.iloc[11] if pd.notna(row.iloc[11]) else ""
+            
+            # Get state from ZIP code
+            state = get_state_from_zip(zip_code, zip_dict)
+            
+            # Increment state count
+            if state in state_counts:
+                state_counts[state] += 1
+            else:
+                state_counts[state] = 1
+    
+    # Create summary dataframe
+    summary_data = []
+    for state, count in state_counts.items():
+        # Determine service entity based on state
+        if state in ["Wisconsin", "Minnesota", "Colorado", "Massachusetts"]:
+            service_entity = "zizzl"
+        elif state == "Florida":
+            service_entity = "NHP"
+        else:
+            service_entity = "TWG"
+        
+        summary_data.append({
+            "State": state,
+            "Number of Lives": count,
+            "Service Entity": service_entity
+        })
+    
+    # Create and return dataframe
+    summary_df = pd.DataFrame(summary_data)
+    return summary_df.sort_values("Number of Lives", ascending=False).reset_index(drop=True)
+
+# Function to download the processed dataframe as CSV
+def get_csv_download_link(df, filename="processed_census.csv"):
+    csv = df.to_csv(index=False)
+    b64 = base64.b64encode(csv.encode()).decode()
+    href = f'<a href="data:file/csv;base64,{b64}" download="{filename}">Download Processed CSV</a>'
+    return href
+
+# Function to process census files similar to Format2CSA macro
+def process_census_file(df):
+    # Clone the dataframe to avoid modifying the original
+    processed_df = df.copy()
+    
+    # Clear formats (not applicable in Python/pandas)
+    
+    # Shift columns (equivalent to Cut/Paste operation in VBA)
+    if len(processed_df.columns) >= 21:  # Assuming we have enough columns like in the VBA
+        # Get columns D-U (column indices 3-20 in 0-based indexing)
+        cols_to_shift = processed_df.iloc[:, 3:21].copy()
+        
+        # Insert at column E (index 4)
+        for i, col in enumerate(cols_to_shift.columns):
+            processed_df.iloc[:, i+4] = cols_to_shift.iloc[:, i]
+    
+    # Format date column (column E)
+    if 'E' in processed_df.columns or 4 < len(processed_df.columns):
+        try:
+            col_e = processed_df.iloc[:, 4]
+            processed_df.iloc[:, 4] = pd.to_datetime(col_e).dt.strftime('%m/%d/%Y')
+        except:
+            st.warning("Could not convert column E to date format. Please check the data.")
+    
+    # Format ZIP code columns (L and S) to 5 digits with leading zeros
+    for col_idx in [11, 18]:  # L is column 12 (index 11), S is column 19 (index 18)
+        if col_idx < len(processed_df.columns):
+            try:
+                # Convert to numeric first to handle any format issues
+                col_vals = pd.to_numeric(processed_df.iloc[:, col_idx], errors='coerce')
+                # Format as 5-digit string with leading zeros
+                processed_df.iloc[:, col_idx] = col_vals.fillna(0).astype(int).astype(str).str.zfill(5)
+                # Replace '00000' (which was NaN) back to empty string
+                processed_df.iloc[:, col_idx] = processed_df.iloc[:, col_idx].replace('00000', '')
+            except:
+                st.warning(f"Could not format column {chr(65+col_idx)} as ZIP code. Please check the data.")
+    
+    # Format numeric columns (N, O, P) to show 2 decimal places
+    for col_idx in [13, 14, 15]:  # N, O, P
+        if col_idx < len(processed_df.columns):
+            try:
+                processed_df.iloc[:, col_idx] = pd.to_numeric(processed_df.iloc[:, col_idx], errors='coerce')
+                processed_df.iloc[:, col_idx] = processed_df.iloc[:, col_idx].fillna(0).round(2)
+            except:
+                st.warning(f"Could not format column {chr(65+col_idx)} as decimal. Please check the data.")
+    
+    # Clear specific columns (F, H, I, J, K, D)
+    for col_idx in [5, 7, 8, 9, 10, 3]:  # F, H, I, J, K, D
+        if col_idx < len(processed_df.columns):
+            processed_df.iloc[:, col_idx] = ''
+    
+    # Replace values in column G (Relationship)
+    if 6 < len(processed_df.columns):
+        replacements = {
+            'E': 'Employee', 
+            'EE': 'Employee',
+            'C': 'Child', 
+            'CH': 'Child',
+            'S': 'Spouse', 
+            'SP': 'Spouse',
+            'Domestic Partner': 'Spouse'
+        }
+        
+        # Function to replace values only if they match exactly
+        def replace_exact(val):
+            if pd.isna(val):
+                return val
+            val_str = str(val).strip()
+            return replacements.get(val_str, val_str)
+        
+        processed_df.iloc[:, 6] = processed_df.iloc[:, 6].apply(replace_exact)
+    
+    # Replace values in column Q (Enrollment Status)
+    if 16 < len(processed_df.columns):
+        status_replacements = {
+            'Enrolled': 'Enroll',
+            'Waived': 'Waive',
+            'W': 'Waive',
+            'E': 'Enroll'
+        }
+        
+        def replace_status(val):
+            if pd.isna(val):
+                return val
+            val_str = str(val).strip()
+            return status_replacements.get(val_str, val_str)
+        
+        processed_df.iloc[:, 16] = processed_df.iloc[:, 16].apply(replace_status)
+    
+    return processed_df
+
+# Main app functionality
+st.header("Upload Census Files")
+uploaded_files = st.file_uploader("Upload Census CSV Files", type="csv", accept_multiple_files=True)
+
+if uploaded_files:
+    if not zip_to_state:
+        st.error("No ZIP code data available. Please select a ZIP code data source in the sidebar.")
+    else:
+        all_processed_dfs = []
+        all_summary_dfs = []
+        
+        for uploaded_file in uploaded_files:
+            # Read the file
+            try:
+                df = pd.read_csv(uploaded_file)
+                st.subheader(f"Processing: {uploaded_file.name}")
+                
+                # Display original data preview
+                st.write("Original Data Preview:")
+                st.dataframe(df.head(5), use_container_width=True)
+                
+                # Process the file
+                processed_df = process_census_file(df)
+                
+                # Display processed data preview
+                st.write("Processed Data Preview:")
+                st.dataframe(processed_df.head(5), use_container_width=True)
+                
+                # Generate and display state summary
+                summary_df = generate_state_summary(processed_df, zip_to_state)
+                st.write(f"State Summary for {uploaded_file.name}:")
+                st.dataframe(summary_df, use_container_width=True)
+                
+                # Add processed dataframe to the list
+                all_processed_dfs.append((uploaded_file.name, processed_df))
+                all_summary_dfs.append((uploaded_file.name, summary_df))
+                
+                # Add download links
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown(get_csv_download_link(processed_df, f"processed_{uploaded_file.name}"), unsafe_allow_html=True)
+                with col2:
+                    st.markdown(get_csv_download_link(summary_df, f"summary_{uploaded_file.name}"), unsafe_allow_html=True)
+                
+                st.success(f"Successfully processed {uploaded_file.name}")
+                st.divider()
+                
+            except Exception as e:
+                st.error(f"Error processing {uploaded_file.name}: {str(e)}")
+                st.exception(e)  # This will show the full error traceback
+        
+        # Option to download all files as a single CSV
+        if len(all_processed_dfs) > 1:
+            st.subheader("Download All Files Combined")
+            
+            combined_processed_df = pd.concat([df for _, df in all_processed_dfs], ignore_index=True)
+            combined_summary_df = pd.DataFrame()
+            
+            # Merge all summaries and aggregate counts by state
+            for _, summary_df in all_summary_dfs:
+                if combined_summary_df.empty:
+                    combined_summary_df = summary_df.copy()
+                else:
+                    # For each state in this summary, add its count to the combined summary
+                    for _, row in summary_df.iterrows():
+                        state = row["State"]
+                        count = row["Number of Lives"]
+                        service_entity = row["Service Entity"]
+                        
+                        # If state exists, add to count, otherwise add new row
+                        if state in combined_summary_df["State"].values:
+                            idx = combined_summary_df[combined_summary_df["State"] == state].index[0]
+                            combined_summary_df.at[idx, "Number of Lives"] += count
+                        else:
+                            new_row = pd.DataFrame({"State": [state], "Number of Lives": [count], "Service Entity": [service_entity]})
+                            combined_summary_df = pd.concat([combined_summary_df, new_row], ignore_index=True)
+            
+            # Sort the combined summary by number of lives
+            combined_summary_df = combined_summary_df.sort_values("Number of Lives", ascending=False).reset_index(drop=True)
+            
+            # Display combined state summary
+            st.write("Combined State Summary:")
+            st.dataframe(combined_summary_df, use_container_width=True)
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown(get_csv_download_link(combined_processed_df, "all_processed_census.csv"), unsafe_allow_html=True)
+            with col2:
+                st.markdown(get_csv_download_link(combined_summary_df, "all_state_summary.csv"), unsafe_allow_html=True)
