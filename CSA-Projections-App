@@ -1,32 +1,52 @@
 import streamlit as st
 import pandas as pd
-import requests
-from io import BytesIO
 import openpyxl
+from io import BytesIO
+import os
 
-# Constants: URLs for ZIP code to state data on GitHub
-ZIP_CODE_URL = "https://raw.githubusercontent.com/OpenDataDE/State-zip-code-GeoJSON/master/uszips.csv"
+# --- Constants & Setup ---
 
+UPLOAD_DIR = "uploaded_files"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# Load ZIP-to-State map from saved .xlsm file with specific columns:
 def load_zip_to_state_map():
-    # Load ZIP code mapping from GitHub
-    df = pd.read_csv(ZIP_CODE_URL, dtype={"zip": str})
-    # Create dict zip -> state
-    return dict(zip(df['zip'], df['state_name']))
+    saved_files = os.listdir(UPLOAD_DIR)
+    if not saved_files:
+        st.warning("No ZIP code files uploaded yet. Please upload your ZIP code .xlsm file below.")
+        return None
+
+    selected_file = st.selectbox("Select ZIP code .xlsm file for ZIP-to-State mapping", saved_files)
+    file_path = os.path.join(UPLOAD_DIR, selected_file)
+
+    try:
+        # Read the .xlsm file, expect columns 'Zip Code' and 'Official State Name'
+        df = pd.read_excel(file_path, dtype={"Zip Code": str})
+        required_cols = ['Zip Code', 'Official State Name']
+        for col in required_cols:
+            if col not in df.columns:
+                st.error(f"The selected ZIP code file must have a '{col}' column.")
+                return None
+        # Create mapping dict from 'Zip Code' to 'Official State Name'
+        zip_to_state = dict(zip(df['Zip Code'].str.zfill(5), df['Official State Name']))
+        st.success(f"Loaded ZIP-to-State mapping from {selected_file}")
+        return zip_to_state
+    except Exception as e:
+        st.error(f"Error reading ZIP code file: {e}")
+        return None
 
 def get_state_from_zip(zip_code, zip_to_state):
-    return zip_to_state.get(zip_code.zfill(5), "Unknown")
+    if not zip_code or not zip_to_state:
+        return "Unknown"
+    return zip_to_state.get(str(zip_code).zfill(5), "Unknown")
 
 def generate_state_summary(census_df, zip_to_state):
-    # Clean and format census data similar to Format2CSA logic:
-    # Replace codes with full text, format dates, clear specified columns
-
-    # Date columns formatting example (if any column named 'DOB' or 'Date')
-    # For this demo, assume 'DOB' is column E in original, here just if exists:
+    # Format dates
     for col in census_df.columns:
         if 'date' in col.lower():
             census_df[col] = pd.to_datetime(census_df[col], errors='coerce').dt.strftime('%m/%d/%Y')
 
-    # Replace codes in a specific column, e.g. 'Relationship' in G (example)
+    # Relationship replacements
     if 'Relationship' in census_df.columns:
         census_df['Relationship'] = census_df['Relationship'].replace({
             "E": "Employee", "EE": "Employee",
@@ -35,31 +55,30 @@ def generate_state_summary(census_df, zip_to_state):
             "Domestic Partner": "Spouse"
         })
 
-    # Enrollment Status replacement
+    # Enrollment status replacements
     if 'Status' in census_df.columns:
         census_df['Status'] = census_df['Status'].replace({
             "Enrolled": "Enroll", "Waived": "Waive",
             "W": "Waive", "E": "Enroll"
         })
 
-    # Map ZIP codes to states and count lives per state
-    # Assuming ZIP code column 'Zip' or 'ZIP' or 'zip' (try to find)
+    # Find ZIP column
     zip_col_candidates = ['Zip', 'ZIP', 'zip', 'ZipCode', 'zip_code', 'Zip Code']
     zip_col = None
     for col in zip_col_candidates:
         if col in census_df.columns:
             zip_col = col
             break
+
     if zip_col is None:
         st.error("No ZIP code column found in census data.")
-        return None
+        return None, None
 
     census_df['State'] = census_df[zip_col].astype(str).apply(lambda z: get_state_from_zip(z, zip_to_state))
 
     # Count lives per state
     state_counts = census_df['State'].value_counts().to_dict()
 
-    # Assign service entity based on state logic
     def service_entity(state):
         if state in ["Wisconsin", "Minnesota", "Colorado", "Massachusetts"]:
             return "zizzl"
@@ -81,19 +100,15 @@ def generate_state_summary(census_df, zip_to_state):
     return summary_df, census_df
 
 def pipeline_update(state_summary_df, pipeline_path, new_or_match, prospect_name, match_name=None):
-    # Load pipeline workbook & worksheet
     wb = openpyxl.load_workbook(pipeline_path)
     ws = wb["Pipeline Test"]
 
-    # Find last row with data in column A
     last_row = ws.max_row
 
-    # Determine target row for insert/update
     if new_or_match == "New":
         target_row = last_row + 1 if last_row >= 4 else 4
         name_to_write = prospect_name
     else:
-        # Find row with match_name in col A
         target_row = None
         for row in ws.iter_rows(min_row=1, max_col=1, max_row=ws.max_row):
             cell = row[0]
@@ -106,25 +121,18 @@ def pipeline_update(state_summary_df, pipeline_path, new_or_match, prospect_name
         name_to_write = match_name
 
     ws.cell(row=target_row, column=1).value = name_to_write
-
-    # Prepare state names string for column B
     state_names_str = ", ".join(state_summary_df['State'].tolist())
-
     ws.cell(row=target_row, column=2).value = state_names_str
-
-    # Total lives sum for column H
     total_lives = state_summary_df["Number of Lives"].sum()
     ws.cell(row=target_row, column=8).value = total_lives
 
-    # Service entity lives sums
     def sum_by_entity(entity):
         return state_summary_df.loc[state_summary_df["Service Entity"] == entity, "Number of Lives"].sum()
 
-    ws.cell(row=target_row, column=13).value = sum_by_entity("zizzl")  # M
-    ws.cell(row=target_row, column=14).value = sum_by_entity("TWG")    # N
-    ws.cell(row=target_row, column=15).value = sum_by_entity("NHP")    # O
+    ws.cell(row=target_row, column=13).value = sum_by_entity("zizzl")
+    ws.cell(row=target_row, column=14).value = sum_by_entity("TWG")
+    ws.cell(row=target_row, column=15).value = sum_by_entity("NHP")
 
-    # Save changes
     wb.save(pipeline_path)
     return True
 
@@ -132,16 +140,28 @@ def pipeline_update(state_summary_df, pipeline_path, new_or_match, prospect_name
 
 st.title("Census Data Formatting + State Summary + Pipeline Update Tool")
 
-# Step 1: Load ZIP code map from GitHub
-with st.spinner("Loading ZIP code to state mapping..."):
-    zip_to_state_map = load_zip_to_state_map()
+# Upload ZIP code .xlsm for persistent ZIP-to-State mapping
+st.header("Step 0: Upload ZIP Code XLSM File")
+uploaded_zip_file = st.file_uploader("Upload ZIP code .xlsm file (must contain 'Zip Code' and 'Official State Name' columns)", type=["xlsm"])
+if uploaded_zip_file is not None:
+    save_path = os.path.join(UPLOAD_DIR, uploaded_zip_file.name)
+    if not os.path.exists(save_path):
+        with open(save_path, "wb") as f:
+            f.write(uploaded_zip_file.getbuffer())
+        st.success(f"Saved ZIP code file: {uploaded_zip_file.name}")
+    else:
+        st.info(f"ZIP code file '{uploaded_zip_file.name}' already exists.")
 
-# Step 2: Upload census CSV file
+# Load ZIP to state map from saved file
+zip_to_state_map = load_zip_to_state_map()
+if zip_to_state_map is None:
+    st.stop()
+
+# Upload census CSV file
+st.header("Step 1: Upload Census CSV File")
 uploaded_census = st.file_uploader("Upload Census CSV file", type=["csv"])
 if uploaded_census:
     census_df = pd.read_csv(uploaded_census, dtype=str)
-
-    # Generate state summary and format census
     with st.spinner("Processing census data..."):
         state_summary_df, formatted_census_df = generate_state_summary(census_df, zip_to_state_map)
 
@@ -149,25 +169,23 @@ if uploaded_census:
         st.subheader("State Summary")
         st.dataframe(state_summary_df)
 
-        # Show some formatted census data preview
         st.subheader("Formatted Census Data Preview")
         st.dataframe(formatted_census_df.head(20))
 
-        # Allow download of state summary Excel
         towrite = BytesIO()
         with pd.ExcelWriter(towrite, engine='openpyxl') as writer:
             state_summary_df.to_excel(writer, sheet_name="State Summary", index=False)
             formatted_census_df.to_excel(writer, sheet_name="Formatted Census", index=False)
         towrite.seek(0)
-        st.download_button(label="Download Summary & Formatted Census Excel", data=towrite, file_name="StateSummary.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.download_button("Download Summary & Formatted Census Excel", data=towrite,
+                           file_name="StateSummary.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-        # Step 3: Pipeline update
-        st.header("Pipeline Update")
-
+        # Pipeline update
+        st.header("Step 2: Pipeline Update")
         pipeline_file = st.file_uploader("Upload Pipeline Excel file (with 'Pipeline Test' sheet)", type=["xlsm", "xlsx"])
         if pipeline_file:
-            # Save pipeline temporarily to disk for openpyxl
-            pipeline_path = f"./temp_pipeline.xlsx"
+            pipeline_path = "./temp_pipeline.xlsx"
             with open(pipeline_path, "wb") as f:
                 f.write(pipeline_file.read())
 
