@@ -1,20 +1,46 @@
 import streamlit as st
 import pandas as pd
 from pathlib import Path
+import requests
+from io import BytesIO
 
-st.set_page_config(page_title="Bulk Census Enrollment Summary", layout="wide")
+# -------------------------
+# Page Config
+# -------------------------
+st.set_page_config(
+    page_title="Bulk Census Enrollment Summary",
+    layout="wide"
+)
 
 st.title("Bulk Census Upload – Enrollment Summary")
 
 st.markdown(
     """
-Upload **multiple census CSV files** and a **Zip → State mapping file** to generate
-an enrollment summary by prospect.
+Upload **multiple census CSV files** to generate an enrollment summary.
+Employee location is derived automatically from ZIP codes.
 """
 )
 
 # -------------------------
-# File Uploads
+# Constants
+# -------------------------
+ZIP_MAPPING_URL = (
+    "https://raw.githubusercontent.com/kc-zh/CSA-Tools/"
+    "46c67cdbf71645d7fe5b08b2799e960c66694352/"
+    "State_County_Zip%20Mapping_StreamLit.xlsx"
+)
+
+ZIP_COL = "Zip Code"
+STATE_COL = "Name"
+
+REQUIRED_CENSUS_COLS = {
+    "Zip Code",
+    "Health Election",
+    "Relationship"
+}
+
+# -------------------------
+# File Upload
 # -------------------------
 census_files = st.file_uploader(
     "Upload Census CSV files",
@@ -22,34 +48,33 @@ census_files = st.file_uploader(
     accept_multiple_files=True
 )
 
-zip_mapping_file = st.file_uploader(
-    "Upload Zip Code → State mapping file (Excel)",
-    type=["xlsx"]
-)
-
 # -------------------------
-# Helper Function
+# Helper Functions
 # -------------------------
 def normalize_zip(zip_val):
+    """Normalize ZIP codes to 5-digit strings."""
     if pd.isna(zip_val):
         return None
     zip_str = str(zip_val).split(".")[0]
     return zip_str.zfill(5)[:5]
 
+@st.cache_data
+def load_zip_mapping():
+    """Load ZIP → State mapping from GitHub safely."""
+    response = requests.get(ZIP_MAPPING_URL)
+    response.raise_for_status()
+
+    zip_df = pd.read_excel(BytesIO(response.content))
+    zip_df[ZIP_COL] = zip_df[ZIP_COL].apply(normalize_zip)
+
+    return dict(zip(zip_df[ZIP_COL], zip_df[STATE_COL]))
+
 # -------------------------
 # Main Logic
 # -------------------------
-if census_files and zip_mapping_file:
+if census_files:
     try:
-        # Load Zip → State mapping
-        zip_df = pd.read_excel(zip_mapping_file)
-
-        ZIP_COL = "Zip Code"
-        STATE_COL = "Name"
-
-        zip_df[ZIP_COL] = zip_df[ZIP_COL].apply(normalize_zip)
-        zip_to_state = dict(zip(zip_df[ZIP_COL], zip_df[STATE_COL]))
-
+        zip_to_state = load_zip_mapping()
         summary_rows = []
 
         for file in census_files:
@@ -59,14 +84,13 @@ if census_files and zip_mapping_file:
             # Clean column names
             df.columns = df.columns.str.strip()
 
-            required_cols = {"Zip Code", "Health Election", "Relationship"}
-            if not required_cols.issubset(df.columns):
-                st.warning(f"Skipping {file.name}: Missing required columns.")
+            if not REQUIRED_CENSUS_COLS.issubset(df.columns):
+                st.warning(
+                    f"Skipping {file.name}: Missing one or more required columns."
+                )
                 continue
 
-            # Apply filters:
-            # 1. Relationship == Employee
-            # 2. Health Election == enroll
+            # Filter: Employee + Enrolled
             filtered_df = df[
                 (df["Relationship"].astype(str).str.lower() == "employee") &
                 (df["Health Election"].astype(str).str.lower() == "enroll")
@@ -80,10 +104,10 @@ if census_files and zip_mapping_file:
                 })
                 continue
 
-            # Normalize zip codes
+            # Normalize ZIPs
             filtered_df["Zip Code"] = filtered_df["Zip Code"].apply(normalize_zip)
 
-            # Map zip → state
+            # Map ZIP → State
             filtered_df["State"] = filtered_df["Zip Code"].map(zip_to_state)
 
             states = (
@@ -101,20 +125,21 @@ if census_files and zip_mapping_file:
 
         summary_df = pd.DataFrame(summary_rows)
 
+        # -------------------------
+        # Output
+        # -------------------------
         st.subheader("Enrollment Summary")
         st.dataframe(summary_df, use_container_width=True)
 
-        # Optional download
-        csv = summary_df.to_csv(index=False).encode("utf-8")
         st.download_button(
-            "Download Summary as CSV",
-            csv,
-            "enrollment_summary.csv",
-            "text/csv"
+            label="Download Summary as CSV",
+            data=summary_df.to_csv(index=False).encode("utf-8"),
+            file_name="enrollment_summary.csv",
+            mime="text/csv"
         )
 
     except Exception as e:
         st.error(f"Error processing files: {e}")
 
 else:
-    st.info("Please upload at least one census CSV and the Zip → State mapping file.")
+    st.info("Please upload at least one census CSV to begin.")
