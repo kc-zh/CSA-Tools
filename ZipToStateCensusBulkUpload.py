@@ -23,7 +23,7 @@ census_files = st.file_uploader(
 )
 
 zip_mapping_file = st.file_uploader(
-    "Upload Zip Code → State Mapping File (Excel)",
+    "Upload Zip Code → State mapping file (Excel)",
     type=["xlsx"]
 )
 
@@ -31,7 +31,6 @@ zip_mapping_file = st.file_uploader(
 # Helper Function
 # -------------------------
 def normalize_zip(zip_val):
-    """Ensure zip codes are 5-digit strings"""
     if pd.isna(zip_val):
         return None
     zip_str = str(zip_val).split(".")[0]
@@ -45,13 +44,10 @@ if census_files and zip_mapping_file:
         # Load Zip → State mapping
         zip_df = pd.read_excel(zip_mapping_file)
 
-        # Explicit column names per your clarification
         ZIP_COL = "Zip Code"
         STATE_COL = "Name"
 
-        # Normalize zip codes in mapping
         zip_df[ZIP_COL] = zip_df[ZIP_COL].apply(normalize_zip)
-
         zip_to_state = dict(zip(zip_df[ZIP_COL], zip_df[STATE_COL]))
 
         summary_rows = []
@@ -60,20 +56,23 @@ if census_files and zip_mapping_file:
             census_name = Path(file.name).stem
             df = pd.read_csv(file)
 
-            # Normalize column names
+            # Clean column names
             df.columns = df.columns.str.strip()
 
-            # Required columns check
-            if "Zip Code" not in df.columns or "Health Election" not in df.columns:
+            required_cols = {"Zip Code", "Health Election", "Relationship"}
+            if not required_cols.issubset(df.columns):
                 st.warning(f"Skipping {file.name}: Missing required columns.")
                 continue
 
-            # Filter enrolled employees only
-            enrolled_df = df[
-                df["Health Election"].astype(str).str.lower() == "enroll"
+            # Apply filters:
+            # 1. Relationship == Employee
+            # 2. Health Election == enroll
+            filtered_df = df[
+                (df["Relationship"].astype(str).str.lower() == "employee") &
+                (df["Health Election"].astype(str).str.lower() == "enroll")
             ].copy()
 
-            if enrolled_df.empty:
+            if filtered_df.empty:
                 summary_rows.append({
                     "Prospect Name": census_name,
                     "Prospect Location": "",
@@ -81,14 +80,14 @@ if census_files and zip_mapping_file:
                 })
                 continue
 
-            # Normalize census zip codes
-            enrolled_df["Zip Code"] = enrolled_df["Zip Code"].apply(normalize_zip)
+            # Normalize zip codes
+            filtered_df["Zip Code"] = filtered_df["Zip Code"].apply(normalize_zip)
 
             # Map zip → state
-            enrolled_df["State"] = enrolled_df["Zip Code"].map(zip_to_state)
+            filtered_df["State"] = filtered_df["Zip Code"].map(zip_to_state)
 
             states = (
-                enrolled_df["State"]
+                filtered_df["State"]
                 .dropna()
                 .unique()
                 .tolist()
@@ -97,7 +96,7 @@ if census_files and zip_mapping_file:
             summary_rows.append({
                 "Prospect Name": census_name,
                 "Prospect Location": ", ".join(sorted(states)),
-                "Projected Enrolled EEs": len(enrolled_df)
+                "Projected Enrolled EEs": len(filtered_df)
             })
 
         summary_df = pd.DataFrame(summary_rows)
