@@ -58,6 +58,21 @@ def normalize_zip(zip_val):
     zip_str = str(zip_val).split(".")[0]
     return zip_str.zfill(5)[:5]
 
+
+def read_csv_with_fallback(uploaded_file):
+    """Attempt to read CSV using multiple encodings."""
+    encodings = ["utf-8", "cp1252", "latin-1"]
+
+    for enc in encodings:
+        try:
+            uploaded_file.seek(0)
+            return pd.read_csv(uploaded_file, encoding=enc)
+        except UnicodeDecodeError:
+            continue
+
+    raise ValueError(f"Could not decode file {uploaded_file.name}")
+
+
 @st.cache_data
 def load_zip_mapping():
     """Load ZIP → State mapping from GitHub safely."""
@@ -69,17 +84,19 @@ def load_zip_mapping():
 
     return dict(zip(zip_df[ZIP_COL], zip_df[STATE_COL]))
 
+
 # -------------------------
 # Main Logic
 # -------------------------
 if census_files:
-    try:
-        zip_to_state = load_zip_mapping()
-        summary_rows = []
+    zip_to_state = load_zip_mapping()
+    summary_rows = []
 
-        for file in census_files:
-            census_name = Path(file.name).stem
-            df = pd.read_csv(file)
+    for file in census_files:
+        census_name = Path(file.name).stem
+
+        try:
+            df = read_csv_with_fallback(file)
 
             # Clean column names
             df.columns = df.columns.str.strip()
@@ -123,23 +140,24 @@ if census_files:
                 "Projected Enrolled EEs": len(filtered_df)
             })
 
-        summary_df = pd.DataFrame(summary_rows)
+        except Exception as file_error:
+            st.error(f"Error processing {file.name}: {file_error}")
+            continue
 
-        # -------------------------
-        # Output
-        # -------------------------
-        st.subheader("Enrollment Summary")
-        st.dataframe(summary_df, use_container_width=True)
+    summary_df = pd.DataFrame(summary_rows)
 
-        st.download_button(
-            label="Download Summary as CSV",
-            data=summary_df.to_csv(index=False).encode("utf-8"),
-            file_name="enrollment_summary.csv",
-            mime="text/csv"
-        )
+    # -------------------------
+    # Output
+    # -------------------------
+    st.subheader("Enrollment Summary")
+    st.dataframe(summary_df, use_container_width=True)
 
-    except Exception as e:
-        st.error(f"Error processing files: {e}")
+    st.download_button(
+        label="Download Summary as CSV",
+        data=summary_df.to_csv(index=False).encode("utf-8"),
+        file_name="enrollment_summary.csv",
+        mime="text/csv"
+    )
 
 else:
     st.info("Please upload at least one census CSV to begin.")
