@@ -677,7 +677,11 @@ def main() -> None:
                 if val == "Auto-fix": return "color:#3B6D11;font-weight:600"
                 return ""
 
-            return df.style.applymap(_color, subset=["Kind"])
+            # applymap was renamed to map in pandas 2.1
+            styler = df.style
+            if hasattr(styler, "map"):
+                return styler.map(_color, subset=["Kind"])
+            return styler.applymap(_color, subset=["Kind"])
 
         with tab_all:
             if all_issues:
