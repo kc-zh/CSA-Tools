@@ -23,6 +23,7 @@ Key behaviours
 • Zip-to-County lookup when the optional zipcodes package is installed.
 • Robust file encoding detection — handles UTF-8, Windows-1252/CP1252 (smart quotes,
   curly apostrophes), Latin-1, and UTF-8-with-BOM exports from Excel/Windows tools.
+• ZIP normalization converts ZIP+4 / 9-digit ZIPs to 5-digit ZIPs.
 """
 
 from __future__ import annotations
@@ -343,9 +344,29 @@ def build_zip_cache() -> dict[str, dict[str, str]]:
 
 
 def _pad_zip(z: object) -> str:
+    """Normalize ZIP values to a 5-digit ZIP code.
+
+    Handles common census exports such as:
+    - 525718303 -> 52571
+    - 52571-8303 -> 52571
+    - 52571 8303 -> 52571
+    - 601 -> 00601
+    - 601.0 -> 00601
+    """
     v = str(z or "").strip()
-    if re.fullmatch(r"\d+", v) and 0 < len(v) < 5:
-        return v.zfill(5)
+    if not v:
+        return ""
+
+    # Excel sometimes stores numeric ZIPs as 601.0 or 525718303.0.
+    if re.fullmatch(r"\d+\.0", v):
+        v = v[:-2]
+
+    # ZIP+4 values may arrive as 9 continuous digits, with a dash, or with spaces.
+    digits = re.sub(r"\D", "", v)
+    if len(digits) >= 5:
+        return digits[:5]
+    if 0 < len(digits) < 5:
+        return digits.zfill(5)
     return v
 
 
