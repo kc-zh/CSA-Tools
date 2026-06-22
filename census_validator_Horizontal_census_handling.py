@@ -1056,7 +1056,7 @@ def run_validation(df: pd.DataFrame, zip_cache: dict[str, dict[str, str]], *, so
 # =============================================================================
 
 def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode("utf-8-sig")
+    return df.to_csv(index=False).encode("utf-8")
 
 
 def issues_to_csv_bytes(errors, warnings, fixes, clears, horizontal_notes=None) -> bytes:
@@ -1066,7 +1066,7 @@ def issues_to_csv_bytes(errors, warnings, fixes, clears, horizontal_notes=None) 
         for n in horizontal_notes:
             combined.append({"Row": "—", "Col": "—", "Field": "Horizontal conversion", "Value": "", "Kind": n.get("Kind", "Note"), "Issue": n.get("Issue", "")})
     combined.sort(key=lambda x: (str(x.get("Row", "0")).zfill(6), x.get("Kind", ""), x.get("Field", "")))
-    return pd.DataFrame(combined, columns=cols).to_csv(index=False).encode("utf-8-sig")
+    return pd.DataFrame(combined, columns=cols).to_csv(index=False).encode("utf-8")
 
 
 SAMPLE_VERTICAL_CSV = """First Name,Last Name,Relationship,DOB,Zip Code,Primary Worksite Zip Code,ICHRA Class,Health Election,Current Health Plan Tier,Annual Salary
