@@ -115,8 +115,9 @@ ANCILLARY_TERMS = {
 }
 
 HEALTH_TERMS = {
-    "health", "medical", "med", "current health", "plan name", "carrier",
+    "health", "medical", "med", "current health", "plan name", "product name", "carrier",
     "coverage tier", "coverage level", "benefit tier", "election tier",
+    "employee cost", "employer cost", "ee cost", "er cost",
 }
 
 HEADER_ALIASES: dict[str, str] = {
@@ -275,8 +276,26 @@ def normalize_tier(v: object) -> tuple[str, Optional[str]]:
     def _hit(options: set[str]) -> bool:
         return key in {_norm(o).replace(" and ", " ").replace(" plus ", " ") for o in options}
 
-    # Keyword fallback catches common employer exports like "EE + Child(ren)".
+    # Common carrier/export abbreviations.
     compact = _compact(original)
+    abbreviation_map = {
+        "eo": "Employee Only",
+        "ee": "Employee Only",
+        "e": "Employee Only",
+        "es": "Employee + Spouse",
+        "ec": "Employee + Children",
+        "ech": "Employee + Children",
+        "eech": "Employee + Children",
+        "ef": "Family",
+        "fa": "Family",
+        "fam": "Family",
+    }
+    if compact in abbreviation_map:
+        canonical = abbreviation_map[compact]
+        note = f"Tier normalised: '{original}' -> '{canonical}'" if original != canonical else None
+        return canonical, note
+
+    # Keyword fallback catches common employer exports like "EE + Child(ren)".
     if _hit(_TIER_WAIVE) or any(x in compact for x in ["waive", "decline", "nocoverage"]):
         return "Waive", f"Tier normalised: '{original}' → 'Waive'" if original != "Waive" else None
     if _hit(_TIER_FAMILY) or "family" in compact or ("spouse" in compact and ("child" in compact or "children" in compact)):
@@ -344,6 +363,35 @@ def lookup_zip(zip_raw: object, cache: dict[str, dict[str, str]]) -> Optional[di
 CANDIDATE_ENCODINGS = ["utf-8-sig", "utf-8", "cp1252", "latin-1"]
 
 
+def _read_csv_text(text: str) -> pd.DataFrame:
+    """Read comma, tab, pipe, or semicolon delimited census text safely."""
+    lines = [line for line in text.splitlines() if line.strip()]
+    header = lines[0] if lines else ""
+    delimiter_counts = {
+        ",": header.count(","),
+        "\t": header.count("\t"),
+        "|": header.count("|"),
+        ";": header.count(";"),
+    }
+    delimiter = max(delimiter_counts, key=delimiter_counts.get)
+    if delimiter_counts[delimiter] == 0:
+        delimiter = ","
+
+    try:
+        df = pd.read_csv(io.StringIO(text), dtype=str, keep_default_na=False, sep=delimiter)
+    except Exception:
+        df = pd.read_csv(io.StringIO(text), dtype=str, keep_default_na=False, sep=None, engine="python")
+
+    # If a tab-delimited file was accidentally parsed as one column, retry as TSV.
+    if df.shape[1] <= 1 and "\t" in header:
+        df = pd.read_csv(io.StringIO(text), dtype=str, keep_default_na=False, sep="\t")
+
+    df = df.fillna("").astype(str).reset_index(drop=True)
+    df = df.reset_index(drop=True)
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+
 def _read_csv_with_fallback_encoding(file_obj) -> tuple[pd.DataFrame, str]:
     """Try a sequence of encodings until one parses cleanly.
 
@@ -353,15 +401,15 @@ def _read_csv_with_fallback_encoding(file_obj) -> tuple[pd.DataFrame, str]:
     raw_bytes = file_obj.read()
     if isinstance(raw_bytes, str):
         # Already decoded (e.g. text pasted into a text area) — just parse it.
-        df = pd.read_csv(io.StringIO(raw_bytes), dtype=str, keep_default_na=False)
-        return df.fillna("").astype(str), "text"
+        df = _read_csv_text(raw_bytes)
+        return df, "text"
 
     last_exc: Optional[Exception] = None
     for enc in CANDIDATE_ENCODINGS:
         try:
             text = raw_bytes.decode(enc)
-            df = pd.read_csv(io.StringIO(text), dtype=str, keep_default_na=False)
-            return df.fillna("").astype(str), enc
+            df = _read_csv_text(text)
+            return df, enc
         except (UnicodeDecodeError, UnicodeError) as exc:
             last_exc = exc
             continue
@@ -376,8 +424,8 @@ def _read_csv_with_fallback_encoding(file_obj) -> tuple[pd.DataFrame, str]:
     # though any replaced characters will show up as the U+FFFD marker.
     try:
         text = raw_bytes.decode("latin-1", errors="replace")
-        df = pd.read_csv(io.StringIO(text), dtype=str, keep_default_na=False)
-        return df.fillna("").astype(str), "latin-1 (with replacement)"
+        df = _read_csv_text(text)
+        return df, "latin-1 (with replacement)"
     except Exception:
         raise last_exc if last_exc else RuntimeError("Unable to decode file")
 
@@ -390,7 +438,7 @@ def read_uploaded_file(uploaded) -> pd.DataFrame:
         # Excel files are binary and encoding-agnostic at the pandas level;
         # openpyxl/xlrd handle internal text encoding themselves.
         df = pd.read_excel(uploaded, dtype=str, keep_default_na=False)
-        df = df.fillna("").astype(str)
+        df = df.fillna("").astype(str).reset_index(drop=True)
     else:
         raise ValueError(f"Unsupported file type: {uploaded.name}")
     df.columns = [str(c).strip() for c in df.columns]
@@ -513,7 +561,14 @@ def _looks_health_header(header: str) -> bool:
     return any(term in h for term in HEALTH_TERMS) or "medical" in h or "med " in f"{h} "
 
 
-def _pick_col(df: pd.DataFrame, aliases: list[str], *, health_only: bool = False) -> Optional[str]:
+def _pick_col(
+    df: pd.DataFrame,
+    aliases: list[str],
+    *,
+    health_only: bool = False,
+    allow_contains: bool = True,
+    allow_fuzzy: bool = True,
+) -> Optional[str]:
     headers = list(df.columns)
     norm_to_header: dict[str, str] = {_norm(h): h for h in headers}
     for a in aliases:
@@ -522,20 +577,24 @@ def _pick_col(df: pd.DataFrame, aliases: list[str], *, health_only: bool = False
             h = norm_to_header[n]
             if not health_only or _looks_health_header(h):
                 return h
-    # contains pass, useful for employer exports with long labels
+    # Contains pass, useful for employer exports with long labels.
+    # Can be disabled for fields where broad aliases like "Employee #" normalize
+    # to "employee" and would otherwise match unrelated columns such as
+    # "Employee Cost".
     alias_norm = [_norm(a) for a in aliases]
-    for h in headers:
-        hn = _norm(h)
-        if health_only and not _looks_health_header(h):
-            continue
-        if any(a and (hn == a or a in hn or hn in a) for a in alias_norm):
-            return h
-    if FUZZY_AVAILABLE:
+    if allow_contains:
+        for h in headers:
+            hn = _norm(h)
+            if health_only and not _looks_health_header(h):
+                continue
+            if any(a and len(a) >= 4 and (hn == a or a in hn or hn in a) for a in alias_norm):
+                return h
+    if allow_fuzzy and FUZZY_AVAILABLE:
         for a in alias_norm:
             match = rf_process.extractOne(a, [_norm(h) for h in headers], scorer=fuzz.token_sort_ratio)
             if match:
                 best_norm, score, _ = match
-                if score >= 88:
+                if score >= 95:
                     h = norm_to_header.get(best_norm)
                     if h and (not health_only or _looks_health_header(h)):
                         return h
@@ -546,7 +605,7 @@ def build_horizontal_column_map(df: pd.DataFrame) -> HorizontalColumnMap:
     cm = HorizontalColumnMap()
     cm.employee_first = _pick_col(df, ["First Name", "Employee First Name", "EE First Name", "First", "Given Name"])
     cm.employee_last = _pick_col(df, ["Last Name", "Employee Last Name", "EE Last Name", "Last", "Surname", "Family Name"])
-    cm.employee_id = _pick_col(df, ["Employee ID", "Employee Number", "Employee #", "Worker ID", "Person Number"])
+    cm.employee_id = _pick_col(df, ["Employee ID", "Employee Number", "Employee #", "Worker ID", "Person Number"], allow_contains=False, allow_fuzzy=False)
     cm.employee_dob = _pick_col(df, ["BIRTH DATE", "DOB", "Employee DOB", "Employee Date of Birth", "Date of Birth", "Birthdate"])
     cm.employee_gender = _pick_col(df, ["Gender", "Sex"])
     cm.employee_email = _pick_col(df, ["Email", "Email Address", "Work Email", "Personal Email"])
@@ -564,14 +623,17 @@ def build_horizontal_column_map(df: pd.DataFrame) -> HorizontalColumnMap:
     cm.health_election = _pick_col(df, ["Health Election", "Medical Election", "Medical Coverage Election", "Coverage Election"], health_only=True)
     cm.health_waive_reason = _pick_col(df, ["MEDICAL WAIVE REASON", "Health Waive Reason", "Waive Reason"], health_only=True)
     cm.plan_vendor = _pick_col(df, ["Current Health Plan Vendor", "Health Carrier", "Medical Carrier", "Carrier", "Medical Vendor"], health_only=True)
-    cm.plan_name = _pick_col(df, ["MEDICAL PLAN NAME", "Medical Plan Name", "Health Plan Name", "Current Health Plan", "Plan Name"], health_only=True)
+    cm.plan_name = (
+        _pick_col(df, ["Product Name", "Current Plan Name", "Current Product Name", "Medical Product Name", "Health Product Name"], allow_fuzzy=False)
+        or _pick_col(df, ["MEDICAL PLAN NAME", "Medical Plan Name", "Health Plan Name", "Current Health Plan", "Plan Name"], health_only=True)
+    )
     cm.plan_tier = _pick_col(df, ["Current Health Plan Tier", "Medical Plan Tier", "Medical Coverage Tier", "Coverage Tier", "Coverage Level", "Benefit Tier", "Election Tier"], health_only=True)
     cm.oop_single = _pick_col(df, ["Current Health Plan OOP (single)", "Medical OOP Single", "OOP Single"], health_only=True)
     cm.oop_family = _pick_col(df, ["Current Health Plan OOP (family)", "Medical OOP Family", "OOP Family"], health_only=True)
     cm.ded_single = _pick_col(df, ["Current Health Plan Deductible (single)", "Medical Deductible Single", "Deductible Single"], health_only=True)
     cm.ded_family = _pick_col(df, ["Current Health Plan Deductible (family)", "Medical Deductible Family", "Deductible Family"], health_only=True)
-    cm.er_cost = _pick_col(df, ["Current Health Plan ER Cost", "Medical ER Cost", "Employer Cost", "Employer Contribution"], health_only=True)
-    cm.ee_cost = _pick_col(df, ["Current Health Plan EE Cost", "Medical EE Cost", "Employee Cost", "Employee Contribution"], health_only=True)
+    cm.er_cost = _pick_col(df, ["Current Health Plan ER Cost", "Medical ER Cost", "Employer Cost", "Pending Employer Cost", "Employer Contribution"], allow_fuzzy=False)
+    cm.ee_cost = _pick_col(df, ["Current Health Plan EE Cost", "Medical EE Cost", "Employee Cost", "Pending Employee Cost", "Employee Contribution"], allow_fuzzy=False)
     cm.annual_salary = _pick_col(df, ["ANNUAL SALARY", "Annual Salary", "Salary", "Base Salary"])
     cm.hourly_rate = _pick_col(df, ["Hourly Rate", "Hourly Wage"])
     cm.hours_per_week = _pick_col(df, ["Hours Per Week", "Weekly Hours"])
@@ -722,10 +784,9 @@ def _sort_dependents(deps: list[dict[str, str]]) -> list[dict[str, str]]:
     def key(d: dict[str, str]) -> tuple[int, int]:
         rel = d.get("Relationship", "")
         rel_order = 0 if rel == "Spouse" else 1 if rel == "Child" else 2
-        try:
-            num = int(d.get("_dep_number", "9999"))
-        except Exception:
-            num = 9999
+        raw_num = str(d.get("_dep_number", "9999"))
+        m = re.search(r"\d+", raw_num)
+        num = int(m.group(0)) if m else 9999
         return rel_order, num
     return sorted(deps, key=key)
 
@@ -743,6 +804,7 @@ def _infer_tier_from_dependents(deps: list[dict[str, str]]) -> str:
 
 
 def convert_horizontal_to_vertical(df: pd.DataFrame, options: HorizontalOptions) -> dict[str, Any]:
+    df = df.fillna("").astype(str).reset_index(drop=True)
     cm = build_horizontal_column_map(df)
     dep_slots, rowwise = find_dependent_slots(df)
     notes: list[dict[str, str]] = []
@@ -811,6 +873,12 @@ def convert_horizontal_to_vertical(df: pd.DataFrame, options: HorizontalOptions)
                     rel, note = normalize_relationship(rel_piece)
                     if note:
                         notes.append({"Kind": "Auto-fix", "Issue": f"Input row {idx + 2}: {note}"})
+                    if rel == "Employee":
+                        # Row-wise horizontal files often include a self/member row in the
+                        # dependent columns. The converter already creates the employee row,
+                        # so keeping this record would duplicate the employee and break the
+                        # intended Employee, Spouse, Child ordering.
+                        continue
                     dep_records.append({"Relationship": rel, "DOB": dob_piece, "First Name": first_piece, "Last Name": last_piece, "_dep_number": f"{dep_num}.{part_i + 1}" if part_count > 1 else dep_num, "_source_row": str(idx + 2)})
         else:
             for slot in dep_slots:
@@ -846,8 +914,8 @@ def convert_horizontal_to_vertical(df: pd.DataFrame, options: HorizontalOptions)
             elif raw_plan_name or (tier and tier != "Waive"):
                 employee_election = "Enroll"
             else:
-                employee_election = "Enroll"
-                notes.append({"Kind": "Warning", "Issue": f"Input row {idxs[0] + 2}: no health election or medical plan found; defaulted employee to Enroll."})
+                employee_election = "Waive"
+                notes.append({"Kind": "Warning", "Issue": f"Input row {idxs[0] + 2}: no health election, product name, or coverage tier found; defaulted employee to Waive."})
 
         if not tier:
             if employee_election == "Waive":
@@ -1011,6 +1079,7 @@ def validate_cell(field_def: dict[str, Any], raw: str) -> dict[str, Any]:
 # =============================================================================
 
 def run_validation(df: pd.DataFrame, zip_cache: dict[str, dict[str, str]], *, source_label: str = "input") -> dict[str, Any]:
+    df = df.fillna("").astype(str).reset_index(drop=True)
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
     fixes: list[dict[str, Any]] = []
@@ -1221,7 +1290,7 @@ def main() -> None:
             if uploaded:
                 df_input = read_uploaded_file(uploaded)
             elif pasted.strip():
-                df_input = pd.read_csv(io.StringIO(pasted), dtype=str, keep_default_na=False).fillna("").astype(str)
+                df_input = _read_csv_text(pasted)
             else:
                 st.warning("Please upload a file or paste CSV data first.")
         except Exception as exc:
