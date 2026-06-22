@@ -1162,13 +1162,22 @@ def run_validation(df: pd.DataFrame, zip_cache: dict[str, dict[str, str]], *, so
                 zv = new_row.get(zip_fname, "").strip()
                 if not zv:
                     continue
+
+                # Only lookup values that already passed U.S. ZIP format validation.
+                # Alphanumeric/non-U.S. postal codes and malformed ZIP values are
+                # already captured above as validation errors, so avoid adding a
+                # second lookup-related issue for the same bad value.
+                if not re.fullmatch(r"\d{5}", zv):
+                    continue
+
                 info = lookup_zip(zv, zip_cache)
                 if info:
                     if not new_row.get(county_fname, "").strip() and info.get("county"):
                         new_row[county_fname] = info["county"]
                         fixes.append({"Row": display_row, "Col": "—", "Field": county_fname, "Value": "", "Kind": "Auto-fix", "Issue": f"County auto-filled from zip '{zv}': '{info['county']}'"})
                 else:
-                    warnings.append({"Row": display_row, "Col": col_letter, "Field": zip_fname, "Value": zv, "Kind": "Warning", "Issue": f"Zip code '{zv}' not found in lookup table"})
+                    errors.append({"Row": display_row, "Col": col_letter, "Field": zip_fname, "Value": zv, "Kind": "Error", "Issue": f"{zip_fname} '{zv}' is not a recognized U.S. ZIP code"})
+                    row_has_error = True
 
         pos = len(out_rows)
         if row_has_error:
