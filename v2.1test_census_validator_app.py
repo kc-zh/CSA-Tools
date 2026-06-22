@@ -37,7 +37,7 @@ import streamlit as st
 
 # ── Optional dependencies ─────────────────────────────────────────────────────
 try:
-    import zipcodes as _zc
+    import uszipcode as _zc
     ZIPCODES_AVAILABLE = True
 except ImportError:  # pragma: no cover - optional runtime dependency
     ZIPCODES_AVAILABLE = False
