@@ -24,6 +24,7 @@ Key behaviours
 • Robust file encoding detection — handles UTF-8, Windows-1252/CP1252 (smart quotes,
   curly apostrophes), Latin-1, and UTF-8-with-BOM exports from Excel/Windows tools.
 • ZIP normalization converts ZIP+4 / 9-digit ZIPs to 5-digit ZIPs.
+• Invalid, unsupported, and non-quotable ZIPs are flagged as errors.
 """
 
 from __future__ import annotations
@@ -48,6 +49,26 @@ try:
     FUZZY_AVAILABLE = True
 except ImportError:  # pragma: no cover - optional runtime dependency
     FUZZY_AVAILABLE = False
+
+
+SUPPORTED_ZIP_STATES = {
+    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI", "ID", "IL", "IN", "IA",
+    "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
+    "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT", "VT",
+    "VA", "WA", "WV", "WI", "WY", "DC",
+}
+
+# ZIPs below are either unsupported by the quoting tool, discontinued, territory-based,
+# or otherwise not accepted by the import even when they are 5 digits.
+# Keep this small and explicit so it is easy to update if the quoting tool flags more.
+KNOWN_INVALID_OR_UNSUPPORTED_ZIPS = {
+    "00820",  # U.S. Virgin Islands; not supported for CSA quoting
+    "03333",
+    "33210",
+    "57507",
+    "85403",
+}
+
 
 # =============================================================================
 # 1. CANONICAL FIELD SCHEMA
@@ -336,10 +357,23 @@ def build_zip_cache() -> dict[str, dict[str, str]]:
     cache: dict[str, dict[str, str]] = {}
     for entry in _zc.list_all():
         z = str(entry.get("zip_code", "")).strip()
-        if z and z not in cache:
+        state = str(entry.get("state", "")).strip().upper()
+        zip_type = str(entry.get("zip_code_type", "")).strip().upper()
+        active = bool(entry.get("active", True))
+
+        if not z or z in KNOWN_INVALID_OR_UNSUPPORTED_ZIPS:
+            continue
+        if state not in SUPPORTED_ZIP_STATES:
+            continue
+        if not active:
+            continue
+        if zip_type and zip_type != "STANDARD":
+            continue
+
+        if z not in cache:
             county_raw = str(entry.get("county") or "")
             county = county_raw.replace(" County", "").strip()
-            cache[z] = {"abbr": str(entry.get("state", "")), "county": county}
+            cache[z] = {"abbr": state, "county": county}
     return cache
 
 
@@ -1098,6 +1132,9 @@ def validate_cell(field_def: dict[str, Any], raw: str) -> dict[str, Any]:
             else:
                 msg = f"{field_def['name']} must be a 5-digit numeric zip, got '{v}'"
             return {"ok": False, "msg": msg, "fixed_val": fixed, "fix_note": note}
+        if fixed in KNOWN_INVALID_OR_UNSUPPORTED_ZIPS:
+            msg = f"{field_def['name']} '{fixed}' is not accepted by the CSA quoting tool"
+            return {"ok": False, "msg": msg, "fixed_val": fixed, "fix_note": note}
         return {"ok": True, "msg": None, "fixed_val": fixed, "fix_note": note}
     if ftype == "numeric":
         clean = v.replace(",", "").replace("$", "").strip()
@@ -1134,6 +1171,7 @@ def run_validation(df: pd.DataFrame, zip_cache: dict[str, dict[str, str]], *, so
         display_row = int(df_ri) + 2
         new_row = {col: "" for col in OUTPUT_COLUMNS}
         row_has_error = False
+        zip_fields_with_errors: set[str] = set()
 
         for fi, field_def in enumerate(FIELDS):
             fname = field_def["name"]
@@ -1150,6 +1188,8 @@ def run_validation(df: pd.DataFrame, zip_cache: dict[str, dict[str, str]], *, so
             if not result["ok"]:
                 errors.append({"Row": display_row, "Col": field_def["col"], "Field": fname, "Value": raw, "Kind": "Error", "Issue": result["msg"]})
                 row_has_error = True
+                if field_def.get("type") == "zipcode":
+                    zip_fields_with_errors.add(fname)
             if result["fix_note"]:
                 fixes.append({"Row": display_row, "Col": field_def["col"], "Field": fname, "Value": raw, "Kind": "Auto-fix", "Issue": result["fix_note"]})
             new_row[fname] = result["fixed_val"] if result["ok"] else raw
@@ -1160,7 +1200,7 @@ def run_validation(df: pd.DataFrame, zip_cache: dict[str, dict[str, str]], *, so
                 ("Primary Worksite Zip Code", "Primary Worksite County", "N"),
             ]:
                 zv = new_row.get(zip_fname, "").strip()
-                if not zv:
+                if not zv or zip_fname in zip_fields_with_errors:
                     continue
 
                 # Only lookup values that already passed U.S. ZIP format validation.
