@@ -62,7 +62,7 @@ SUPPORTED_ZIP_STATES = {
 # or otherwise not accepted by the import even when they are 5 digits.
 # Keep this small and explicit so it is easy to update if the quoting tool flags more.
 KNOWN_INVALID_OR_UNSUPPORTED_ZIPS = {
-    "00820",  # U.S. Virgin Islands; not supported for CSA quoting
+    "00820",  # U.S. Virgin Islands; not supported for  quoting
     "03333",
     "33210",
     "57507",
@@ -1133,7 +1133,7 @@ def validate_cell(field_def: dict[str, Any], raw: str) -> dict[str, Any]:
                 msg = f"{field_def['name']} must be a 5-digit numeric zip, got '{v}'"
             return {"ok": False, "msg": msg, "fixed_val": fixed, "fix_note": note}
         if fixed in KNOWN_INVALID_OR_UNSUPPORTED_ZIPS:
-            msg = f"{field_def['name']} '{fixed}' is not accepted by the CSA quoting tool"
+            msg = f"{field_def['name']} '{fixed}' is invalid"
             return {"ok": False, "msg": msg, "fixed_val": fixed, "fix_note": note}
         return {"ok": True, "msg": None, "fixed_val": fixed, "fix_note": note}
     if ftype == "numeric":
