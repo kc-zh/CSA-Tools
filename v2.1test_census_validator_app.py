@@ -34,7 +34,7 @@ from typing import Any, Optional
 
 import pandas as pd
 import streamlit as st
-
+import uszipcode as _zc
 # ── Optional dependencies ─────────────────────────────────────────────────────
 try:
     import uszipcode as _zc
