@@ -216,7 +216,7 @@ def _add_rel(canonical: str, *aliases: str) -> None:
 
 _add_rel("Employee", "employee", "ee", "emp", "subscriber", "self", "primary", "insured", "member", "worker")
 _add_rel("Spouse", "spouse", "sp", "husband", "wife", "partner", "domestic partner", "life partner",
-         "registered domestic partner", "common law spouse", "common law partner", "spse", "sps")
+         "registered domestic partner", "common law spouse", "common law partner", "DomesticPartner", "domesticpartner", "spse", "sps")
 _add_rel("Child", "child", "ch", "dependent", "dep", "daughter", "son", "stepchild", "step child",
          "adopted child", "foster child", "stepson", "stepdaughter", "child of domestic partner", "child child")
 
