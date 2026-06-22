@@ -34,10 +34,10 @@ from typing import Any, Optional
 
 import pandas as pd
 import streamlit as st
-import uszipcode as _zc
+
 # ── Optional dependencies ─────────────────────────────────────────────────────
 try:
-    import uszipcode as _zc
+    import zipcodes as _zc
     ZIPCODES_AVAILABLE = True
 except ImportError:  # pragma: no cover - optional runtime dependency
     ZIPCODES_AVAILABLE = False
