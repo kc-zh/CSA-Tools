@@ -21,6 +21,8 @@ Key behaviours
 • Fuzzy + exact header matching for vertical and horizontal inputs.
 • Auto-clears selected PII fields in the final output.
 • Zip-to-County lookup when the optional zipcodes package is installed.
+• Robust file encoding detection — handles UTF-8, Windows-1252/CP1252 (smart quotes,
+  curly apostrophes), Latin-1, and UTF-8-with-BOM exports from Excel/Windows tools.
 """
 
 from __future__ import annotations
@@ -335,16 +337,64 @@ def lookup_zip(zip_raw: object, cache: dict[str, dict[str, str]]) -> Optional[di
 # 5. FILE INGESTION
 # =============================================================================
 
+# Encodings to try, in order. utf-8-sig handles BOM-prefixed UTF-8 (common from
+# Excel "CSV UTF-8" exports). cp1252 / latin-1 handle the classic Windows export
+# case where curly quotes, em-dashes, etc. show up as bytes like 0x92, which are
+# not valid UTF-8 and otherwise throw UnicodeDecodeError.
+CANDIDATE_ENCODINGS = ["utf-8-sig", "utf-8", "cp1252", "latin-1"]
+
+
+def _read_csv_with_fallback_encoding(file_obj) -> tuple[pd.DataFrame, str]:
+    """Try a sequence of encodings until one parses cleanly.
+
+    Accepts a file-like object (e.g. an uploaded file or BytesIO) and returns
+    the parsed DataFrame along with the encoding that worked.
+    """
+    raw_bytes = file_obj.read()
+    if isinstance(raw_bytes, str):
+        # Already decoded (e.g. text pasted into a text area) — just parse it.
+        df = pd.read_csv(io.StringIO(raw_bytes), dtype=str, keep_default_na=False)
+        return df.fillna("").astype(str), "text"
+
+    last_exc: Optional[Exception] = None
+    for enc in CANDIDATE_ENCODINGS:
+        try:
+            text = raw_bytes.decode(enc)
+            df = pd.read_csv(io.StringIO(text), dtype=str, keep_default_na=False)
+            return df.fillna("").astype(str), enc
+        except (UnicodeDecodeError, UnicodeError) as exc:
+            last_exc = exc
+            continue
+        except Exception as exc:
+            # A decode succeeded but pandas couldn't parse it — try next encoding
+            # only if it's likely a decode artifact; otherwise re-raise immediately
+            # on the last attempt.
+            last_exc = exc
+            continue
+
+    # Last resort: decode with errors="replace" using latin-1 so we never crash,
+    # though any replaced characters will show up as the U+FFFD marker.
+    try:
+        text = raw_bytes.decode("latin-1", errors="replace")
+        df = pd.read_csv(io.StringIO(text), dtype=str, keep_default_na=False)
+        return df.fillna("").astype(str), "latin-1 (with replacement)"
+    except Exception:
+        raise last_exc if last_exc else RuntimeError("Unable to decode file")
+
+
 def read_uploaded_file(uploaded) -> pd.DataFrame:
     name = uploaded.name.lower()
     if name.endswith(".csv"):
-        df = pd.read_csv(uploaded, dtype=str, keep_default_na=False)
+        df, _enc_used = _read_csv_with_fallback_encoding(uploaded)
     elif name.endswith((".xlsx", ".xls")):
+        # Excel files are binary and encoding-agnostic at the pandas level;
+        # openpyxl/xlrd handle internal text encoding themselves.
         df = pd.read_excel(uploaded, dtype=str, keep_default_na=False)
+        df = df.fillna("").astype(str)
     else:
         raise ValueError(f"Unsupported file type: {uploaded.name}")
     df.columns = [str(c).strip() for c in df.columns]
-    return df.fillna("").astype(str)
+    return df
 
 # =============================================================================
 # 6. COLUMN MAPPING FOR STANDARD VERTICAL FILES
@@ -1056,7 +1106,7 @@ def run_validation(df: pd.DataFrame, zip_cache: dict[str, dict[str, str]], *, so
 # =============================================================================
 
 def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode("utf-8-sig")
+    return df.to_csv(index=False).encode("utf-8")
 
 
 def issues_to_csv_bytes(errors, warnings, fixes, clears, horizontal_notes=None) -> bytes:
@@ -1066,7 +1116,7 @@ def issues_to_csv_bytes(errors, warnings, fixes, clears, horizontal_notes=None) 
         for n in horizontal_notes:
             combined.append({"Row": "—", "Col": "—", "Field": "Horizontal conversion", "Value": "", "Kind": n.get("Kind", "Note"), "Issue": n.get("Issue", "")})
     combined.sort(key=lambda x: (str(x.get("Row", "0")).zfill(6), x.get("Kind", ""), x.get("Field", "")))
-    return pd.DataFrame(combined, columns=cols).to_csv(index=False).encode("utf-8-sig")
+    return pd.DataFrame(combined, columns=cols).to_csv(index=False).encode("utf-8")
 
 
 SAMPLE_VERTICAL_CSV = """First Name,Last Name,Relationship,DOB,Zip Code,Primary Worksite Zip Code,ICHRA Class,Health Election,Current Health Plan Tier,Annual Salary
