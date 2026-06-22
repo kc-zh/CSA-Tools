@@ -1115,7 +1115,7 @@ def main() -> None:
     </style>
     """, unsafe_allow_html=True)
 
-    st.title("📋 Census Validator & Reformatter")
+    st.title("Census Validator & Reformatter")
     st.caption("Vertical CSA census validation · Horizontal dependent census conversion · Health-only plan/tier logic · System-ready CSV export")
 
     with st.sidebar:
