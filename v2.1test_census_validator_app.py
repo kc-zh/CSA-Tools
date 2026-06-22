@@ -34,13 +34,10 @@ from typing import Any, Optional
 
 import pandas as pd
 import streamlit as st
+import zipcodes as _zc
 
 # ── Optional dependencies ─────────────────────────────────────────────────────
-try:
-    import zipcodes as _zc
-    ZIPCODES_AVAILABLE = True
-except ImportError:  # pragma: no cover - optional runtime dependency
-    ZIPCODES_AVAILABLE = False
+
 
 try:
     from rapidfuzz import fuzz, process as rf_process
