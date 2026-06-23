@@ -246,10 +246,10 @@ _add_rel("Child", "child", "ch", "dependent", "dep", "daughter", "son", "stepchi
 _ELECTION_ENROLL = {"enroll", "e", "yes", "y", "enrolled", "participating", "active", "covered", "elect", "elected"}
 _ELECTION_WAIVE = {"waive", "w", "no", "n", "waived", "decline", "declined", "opt out", "optout", "not participating", "waiving"}
 
-_TIER_EMP_ONLY = {"employee only", "employee", "ee only", "employee only coverage", "single", "individual", "self only"}
-_TIER_EMP_SPOUSE = {"employee spouse", "employee and spouse", "employee + spouse", "ee spouse", "ee + spouse", "ee sp", "employee plus spouse"}
-_TIER_EMP_CHILDREN = {"employee children", "employee child", "employee + children", "employee + child", "ee children", "ee child", "ee + children", "ee + child", "employee plus children", "parent child", "parent children"}
-_TIER_FAMILY = {"family", "employee family", "employee + family", "ee family", "ee + family", "employee spouse children", "employee + spouse + children", "employee spouse child", "ee spouse children", "ee + spouse + children"}
+_TIER_EMP_ONLY = {"employee only", "employee", "ee only", "employee only coverage", "single", "individual", "self only", "ee"}
+_TIER_EMP_SPOUSE = {"employee spouse", "employee and spouse", "employee + spouse", "ee spouse", "ee + spouse", "ee sp", "employee plus spouse", "es"}
+_TIER_EMP_CHILDREN = {"employee children", "employee child", "employee + children", "employee + child", "ee children", "ee child", "ee + children", "ee + child", "employee plus children", "parent child", "parent children", "ec"}
+_TIER_FAMILY = {"family", "employee family", "employee + family", "ee family", "ee + family", "employee spouse children", "employee + spouse + children", "employee spouse child", "ee spouse children", "ee + spouse + children", "ef"}
 _TIER_WAIVE = {"waive", "waived", "decline", "declined", "no coverage", "none", "not enrolled", "no election"}
 
 
