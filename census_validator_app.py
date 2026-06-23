@@ -1,1263 +1,1815 @@
 """
-CSA Census Validator, Reformatter, and Horizontal Census Converter
-==================================================================
+Census Validator & Reformatter — Streamlit App
+==============================================
+Install:  pip install streamlit pandas zipcodes openpyxl rapidfuzz
+Run:      streamlit run census_validator_app_horizontal.py
 
-Single-file Streamlit app for testing and deployment.
-
-Install:
-    pip install streamlit pandas openpyxl rapidfuzz zipcodes
-
-Run:
-    streamlit run streamlit_census_app_single.py
-
-Notes:
-    - This file intentionally contains both the processing engine and a thin
-      Streamlit test interface so it can be dropped into a GitHub repository as
-      one app file.
-    - The processing functions are pure enough to be reused outside Streamlit.
-    - Streamlit is only used in the app wrapper at the bottom of this file.
+Key behaviours
+──────────────
+• Accepts standard vertical CSA census files and horizontal dependent census files.
+• Horizontal mode creates one Employee row, then Spouse row(s), then Child row(s).
+• Dependent Health Election is derived from the employee's health/medical coverage tier:
+  Employee Only → dependents Waive
+  Employee + Spouse → spouse Enroll, children Waive
+  Employee + Children → children Enroll, spouse Waive
+  Family → spouse and children Enroll
+• If no health/medical tier exists but a health/medical plan exists, the app can infer listed
+  dependents as enrolled. This is controlled in the sidebar.
+• Only health/medical fields are used for horizontal plan/tier/election detection. Dental,
+  vision, life, disability, and other ancillary fields are ignored.
+• Fixed output column order matching the CSA import template.
+• Fuzzy + exact header matching for vertical and horizontal inputs.
+• Auto-clears selected PII fields in the final output.
+• Zip-to-County lookup when the optional zipcodes package is installed.
+• Robust file encoding detection — handles UTF-8, Windows-1252/CP1252 (smart quotes,
+  curly apostrophes), Latin-1, and UTF-8-with-BOM exports from Excel/Windows tools.
+• ZIP normalization converts ZIP+4 / 9-digit ZIPs to 5-digit ZIPs.
+• Invalid, unsupported, and non-quotable ZIPs are flagged as errors.
 """
 
 from __future__ import annotations
 
+import csv
 import io
-import logging
 import re
-import traceback
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any, Iterable, Optional
+from typing import Any, Optional
 
 import pandas as pd
 import streamlit as st
 
+# ── Optional dependencies ─────────────────────────────────────────────────────
 try:
-    from rapidfuzz import fuzz
-    RAPIDFUZZ_AVAILABLE = True
-except Exception:
-    fuzz = None
-    RAPIDFUZZ_AVAILABLE = False
-
-try:
-    import zipcodes as zipcodes_pkg
+    import zipcodes as _zc
     ZIPCODES_AVAILABLE = True
-except Exception:
-    zipcodes_pkg = None
+except ImportError:  # pragma: no cover - optional runtime dependency
     ZIPCODES_AVAILABLE = False
 
-APP_VERSION = "2026.06.15.single-file.1"
-LOGGER = logging.getLogger("csa_census_app")
-if not LOGGER.handlers:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+try:
+    from rapidfuzz import fuzz, process as rf_process
+    FUZZY_AVAILABLE = True
+except ImportError:  # pragma: no cover - optional runtime dependency
+    FUZZY_AVAILABLE = False
 
 
-class InputMode(str, Enum):
-    AUTO = "Auto"
-    VERTICAL = "Vertical"
-    HORIZONTAL = "Horizontal"
+SUPPORTED_ZIP_STATES = {
+    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI", "ID", "IL", "IN", "IA",
+    "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
+    "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT", "VT",
+    "VA", "WA", "WV", "WI", "WY", "DC",
+}
+
+# ZIPs below are either unsupported by the quoting tool, discontinued, territory-based,
+# or otherwise not accepted by the import even when they are 5 digits.
+# Keep this small and explicit so it is easy to update if the quoting tool flags more.
+KNOWN_INVALID_OR_UNSUPPORTED_ZIPS = {
+    "00820",  # U.S. Virgin Islands; not supported for  quoting
+    "03333",
+    "33210",
+    "57507",
+    "85403",
+}
 
 
-@dataclass(frozen=True)
-class FieldDef:
-    col: str
-    name: str
-    required: bool
-    kind: str
-    values: tuple[str, ...] = ()
-
-
-FIELDS: tuple[FieldDef, ...] = (
-    FieldDef("A", "First Name", True, "text"),
-    FieldDef("B", "Last Name", True, "text"),
-    FieldDef("C", "Employee ID", False, "text"),
-    FieldDef("D", "Relationship", True, "relationship"),
-    FieldDef("E", "DOB", True, "date"),
-    FieldDef("F", "Gender", False, "text"),
-    FieldDef("G", "Email", False, "text"),
-    FieldDef("H", "Address Line 1", False, "text"),
-    FieldDef("I", "Address Line 2", False, "text"),
-    FieldDef("J", "City", False, "text"),
-    FieldDef("K", "State", False, "text"),
-    FieldDef("L", "Zip Code", True, "zipcode"),
-    FieldDef("M", "County", False, "text"),
-    FieldDef("N", "Primary Worksite Zip Code", True, "zipcode"),
-    FieldDef("O", "Primary Worksite County", False, "text"),
-    FieldDef("P", "ICHRA Class", False, "text"),
-    FieldDef("Q", "Health Election", True, "election"),
-    FieldDef("R", "Current Health Plan Vendor", False, "text"),
-    FieldDef("S", "Current Health Plan", False, "text"),
-    FieldDef("T", "Current Health Plan Tier", False, "tier", ("Employee Only", "Employee + Spouse", "Employee + Children", "Family", "")),
-    FieldDef("U", "Current Health Plan OOP (single)", False, "numeric"),
-    FieldDef("V", "Current Health Plan OOP (family)", False, "numeric"),
-    FieldDef("W", "Current Health Plan Deductible (single)", False, "numeric"),
-    FieldDef("X", "Current Health Plan Deductible (family)", False, "numeric"),
-    FieldDef("Y", "Current Health Plan ER Cost", False, "numeric"),
-    FieldDef("Z", "Current Health Plan EE Cost", False, "numeric"),
-    FieldDef("AA", "Annual Salary", False, "numeric"),
-    FieldDef("AB", "Hourly Rate", False, "numeric"),
-    FieldDef("AC", "Hours Per Week", False, "numeric"),
-    FieldDef("AD", "Notes", False, "text"),
-)
-
-OUTPUT_COLUMNS = [f.name for f in FIELDS]
-FIELD_BY_NAME = {f.name: f for f in FIELDS}
-FIELD_INDEX = {f.name: idx for idx, f in enumerate(FIELDS)}
+# =============================================================================
+# 1. CANONICAL FIELD SCHEMA
+# =============================================================================
 
 CLEARED_FIELDS = {
-    "Employee ID",
-    "Gender",
-    "Email",
-    "Address Line 1",
-    "Address Line 2",
-    "City",
-    "State",
+    "Employee ID", "Gender", "Email",
+    "Address Line 1", "Address Line 2", "City", "State",
 }
 
-ANCILLARY_WORDS = {
-    "dental", "dent", "vision", "vis", "life", "std", "ltd", "disability",
-    "accident", "critical", "hospital", "supplemental", "voluntary", "ancillary",
+FIELDS: list[dict[str, Any]] = [
+    {"col": "A",  "name": "First Name",                      "required": True,  "type": "alpha"},
+    {"col": "B",  "name": "Last Name",                       "required": True,  "type": "alpha"},
+    {"col": "C",  "name": "Employee ID",                     "required": False, "type": "alpha"},
+    {"col": "D",  "name": "Relationship",                    "required": True,  "type": "relationship"},
+    {"col": "E",  "name": "DOB",                             "required": True,  "type": "date"},
+    {"col": "F",  "name": "Gender",                          "required": False, "type": "alpha"},
+    {"col": "G",  "name": "Email",                           "required": False, "type": "alpha"},
+    {"col": "H",  "name": "Address Line 1",                  "required": False, "type": "alpha"},
+    {"col": "I",  "name": "Address Line 2",                  "required": False, "type": "alpha"},
+    {"col": "J",  "name": "City",                            "required": False, "type": "alpha"},
+    {"col": "K",  "name": "State",                           "required": False, "type": "alpha"},
+    {"col": "L",  "name": "Zip Code",                        "required": True,  "type": "zipcode"},
+    {"col": "M",  "name": "County",                          "required": False, "type": "alpha"},
+    {"col": "N",  "name": "Primary Worksite Zip Code",       "required": True,  "type": "zipcode"},
+    {"col": "O",  "name": "Primary Worksite County",         "required": False, "type": "alpha"},
+    {"col": "P",  "name": "ICHRA Class",                     "required": False, "type": "alpha"},
+    {"col": "Q",  "name": "Health Election",                 "required": True,  "type": "election"},
+    {"col": "R",  "name": "Current Health Plan Vendor",      "required": False, "type": "alpha"},
+    {"col": "S",  "name": "Current Health Plan",             "required": False, "type": "alpha"},
+    {"col": "T",  "name": "Current Health Plan Tier",        "required": False, "type": "tier"},
+    {"col": "U",  "name": "Current Health Plan OOP (single)","required": False, "type": "numeric"},
+    {"col": "V",  "name": "Current Health Plan OOP (family)","required": False, "type": "numeric"},
+    {"col": "W",  "name": "Current Health Plan Deductible (single)", "required": False, "type": "numeric"},
+    {"col": "X",  "name": "Current Health Plan Deductible (family)", "required": False, "type": "numeric"},
+    {"col": "Y",  "name": "Current Health Plan ER Cost",     "required": False, "type": "numeric"},
+    {"col": "Z",  "name": "Current Health Plan EE Cost",     "required": False, "type": "numeric"},
+    {"col": "AA", "name": "Annual Salary",                   "required": False, "type": "numeric"},
+    {"col": "AB", "name": "Hourly Rate",                     "required": False, "type": "numeric"},
+    {"col": "AC", "name": "Hours Per Week",                  "required": False, "type": "numeric"},
+    {"col": "AD", "name": "Notes",                           "required": False, "type": "alpha"},
+]
+
+OUTPUT_COLUMNS = [f["name"] for f in FIELDS]
+_FIELD_IDX_BY_NAME = {f["name"]: i for i, f in enumerate(FIELDS)}
+_FIELD_BY_NAME = {f["name"]: f for f in FIELDS}
+
+# =============================================================================
+# 2. HEADER NORMALISATION + ALIASES
+# =============================================================================
+
+def _norm(s: object) -> str:
+    s = str(s or "").strip().lower()
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _compact(s: object) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(s or "").lower())
+
+
+ANCILLARY_TERMS = {
+    "dental", "vision", "life", "disability", "std", "ltd", "accident",
+    "critical", "illness", "hospital", "indemnity", "cancer", "legal",
+    "pet", "commuter", "parking", "transit", "supplemental", "voluntary",
 }
 
-US_STATE_CODES = {
-    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI", "ID",
-    "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS",
-    "MO", "MT", "NE", "NV", "NH", "NJ", "NM", "NY", "NC", "ND", "OH", "OK",
-    "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV",
-    "WI", "WY", "DC", "PR", "VI", "GU", "AS", "MP",
+HEALTH_TERMS = {
+    "health", "medical", "med", "current health", "plan name", "product name", "carrier",
+    "coverage tier", "coverage level", "benefit tier", "election tier",
+    "employee cost", "employer cost", "ee cost", "er cost",
 }
 
-
-@dataclass
-class EngineOptions:
-    input_mode: InputMode = InputMode.AUTO
-    assumption_level: int = 2
-    header_match_threshold: int = 88
-    relationship_match_threshold: int = 86
-    horizontal_detection_sensitivity: int = 3
-    auto_fill_county_from_zip: bool = True
-    strict_health_only: bool = True
-    infer_dependents_enrolled_when_tier_missing: bool = True
-    auto_placeholder_names: bool = True
-    inherit_worksite_zip_to_dependents: bool = True
-    exclude_interns_contractors_inactive: bool = True
-    max_file_rows: int = 250_000
-    max_file_columns: int = 500
-
-
-@dataclass
-class Issue:
-    row: Any
-    col: str
-    field: str
-    value: str
-    kind: str
-    issue: str
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "Row": self.row,
-            "Col": self.col,
-            "Field": self.field,
-            "Value": self.value,
-            "Kind": self.kind,
-            "Issue": self.issue,
-        }
-
-
-@dataclass
-class ProcessResult:
-    reformatted_df: pd.DataFrame
-    errors: list[Issue] = field(default_factory=list)
-    warnings: list[Issue] = field(default_factory=list)
-    fixes: list[Issue] = field(default_factory=list)
-    clears: list[Issue] = field(default_factory=list)
-    notes: list[Issue] = field(default_factory=list)
-    mapping_notes: list[str] = field(default_factory=list)
-    unrecognized_columns: list[str] = field(default_factory=list)
-    error_positions: list[int] = field(default_factory=list)
-    valid_positions: list[int] = field(default_factory=list)
-    source_rows: int = 0
-    source_columns: int = 0
-    horizontal_used: bool = False
-    detect_reason: str = ""
-    exception_text: str = ""
-
-    @property
-    def total_rows(self) -> int:
-        return len(self.reformatted_df)
-
-    @property
-    def has_errors(self) -> bool:
-        return bool(self.errors)
-
-    @property
-    def valid_df(self) -> pd.DataFrame:
-        if self.reformatted_df.empty:
-            return pd.DataFrame(columns=OUTPUT_COLUMNS)
-        return self.reformatted_df.iloc[self.valid_positions].reset_index(drop=True)
-
-    @property
-    def error_df(self) -> pd.DataFrame:
-        if self.reformatted_df.empty or not self.error_positions:
-            return pd.DataFrame(columns=OUTPUT_COLUMNS)
-        return self.reformatted_df.iloc[self.error_positions].reset_index(drop=True)
-
-    def issue_frame(self) -> pd.DataFrame:
-        rows = [i.as_dict() for i in self.errors + self.warnings + self.fixes + self.clears + self.notes]
-        return pd.DataFrame(rows, columns=["Row", "Col", "Field", "Value", "Kind", "Issue"])
-
-    def summary(self) -> dict[str, Any]:
-        return {
-            "source_rows": self.source_rows,
-            "source_columns": self.source_columns,
-            "output_rows": self.total_rows,
-            "errors": len(self.errors),
-            "warnings": len(self.warnings),
-            "fixes": len(self.fixes),
-            "clears": len(self.clears),
-            "notes": len(self.notes),
-            "horizontal_used": self.horizontal_used,
-            "detect_reason": self.detect_reason,
-            "exception": bool(self.exception_text),
-        }
-
-
-# =============================================================================
-# Normalization helpers
-# =============================================================================
-
-
-def norm_key(value: Any) -> str:
-    text = "" if value is None else str(value)
-    text = text.replace("\ufeff", " ").strip().lower()
-    text = re.sub(r"[\r\n\t]+", " ", text)
-    text = re.sub(r"[^a-z0-9]+", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def cell(value: Any) -> str:
-    if value is None:
-        return ""
-    text = str(value)
-    if text.lower() in {"nan", "none", "nat"}:
-        return ""
-    return text.strip()
-
-
-def row_value(row: pd.Series, column: Optional[str]) -> str:
-    if not column or column not in row.index:
-        return ""
-    return cell(row[column])
-
-
-def first_nonblank(*values: Any) -> str:
-    for value in values:
-        text = cell(value)
-        if text:
-            return text
-    return ""
-
-
-def split_multi(value: Any) -> list[str]:
-    text = cell(value)
-    if not text:
-        return []
-    return [part.strip() for part in re.split(r"\s*[|;]\s*", text) if part.strip()]
-
-
-def contains_any(text: Any, words: Iterable[str]) -> bool:
-    key = norm_key(text)
-    return any(w in key.split() or w in key for w in words)
-
-
-def is_ancillary_header(header: Any) -> bool:
-    return contains_any(header, ANCILLARY_WORDS)
-
-
-# =============================================================================
-# Header aliases and mapping
-# =============================================================================
-
-
-def make_aliases() -> dict[str, str]:
-    aliases = {
-        "first name": "First Name", "firstname": "First Name", "first": "First Name", "given name": "First Name",
-        "employee first name": "First Name", "ee first name": "First Name", "member first name": "First Name",
-        "last name": "Last Name", "lastname": "Last Name", "last": "Last Name", "surname": "Last Name",
-        "family name": "Last Name", "employee last name": "Last Name", "ee last name": "Last Name", "member last name": "Last Name",
-        "employee id": "Employee ID", "emp id": "Employee ID", "empid": "Employee ID", "ee id": "Employee ID",
-        "employee number": "Employee ID", "employee no": "Employee ID", "employee #": "Employee ID", "id": "Employee ID",
-        "relationship": "Relationship", "relation": "Relationship", "rel": "Relationship", "member type": "Relationship",
-        "dependent type": "Relationship", "coverage member type": "Relationship",
-        "dob": "DOB", "date of birth": "DOB", "birth date": "DOB", "birthdate": "DOB", "employee dob": "DOB",
-        "gender": "Gender", "sex": "Gender",
-        "email": "Email", "email address": "Email", "e mail": "Email", "work email": "Email", "personal email": "Email",
-        "address": "Address Line 1", "address 1": "Address Line 1", "address line 1": "Address Line 1", "street address": "Address Line 1",
-        "address 2": "Address Line 2", "address line 2": "Address Line 2", "apt": "Address Line 2", "suite": "Address Line 2",
-        "city": "City", "town": "City",
-        "state": "State", "st": "State", "state code": "State",
-        "zip": "Zip Code", "zipcode": "Zip Code", "zip code": "Zip Code", "postal code": "Zip Code", "home zip": "Zip Code",
-        "home zip code": "Zip Code", "residential zip": "Zip Code", "employee zip": "Zip Code",
-        "county": "County", "home county": "County",
-        "primary worksite zip code": "Primary Worksite Zip Code", "primary worksite zip": "Primary Worksite Zip Code",
-        "worksite zip": "Primary Worksite Zip Code", "worksite zip code": "Primary Worksite Zip Code", "work zip": "Primary Worksite Zip Code",
-        "site zip": "Primary Worksite Zip Code", "primary work zip": "Primary Worksite Zip Code",
-        "primary worksite county": "Primary Worksite County", "worksite county": "Primary Worksite County", "work county": "Primary Worksite County",
-        "ichra class": "ICHRA Class", "class": "ICHRA Class", "benefit class": "ICHRA Class", "employee class": "ICHRA Class",
-        "health election": "Health Election", "medical election": "Health Election", "benefit election": "Health Election",
-        "coverage election": "Health Election", "election": "Health Election", "enrollment election": "Health Election",
-        "current health plan vendor": "Current Health Plan Vendor", "current health vendor": "Current Health Plan Vendor",
-        "health vendor": "Current Health Plan Vendor", "medical vendor": "Current Health Plan Vendor", "carrier": "Current Health Plan Vendor",
-        "health carrier": "Current Health Plan Vendor", "medical carrier": "Current Health Plan Vendor", "insurance carrier": "Current Health Plan Vendor",
-        "current health plan": "Current Health Plan", "health plan": "Current Health Plan", "medical plan": "Current Health Plan",
-        "plan name": "Current Health Plan", "current medical plan": "Current Health Plan", "medical plan name": "Current Health Plan",
-        "current health plan tier": "Current Health Plan Tier", "health plan tier": "Current Health Plan Tier",
-        "medical tier": "Current Health Plan Tier", "medical plan tier": "Current Health Plan Tier", "coverage tier": "Current Health Plan Tier",
-        "plan tier": "Current Health Plan Tier", "tier": "Current Health Plan Tier",
-        "current health plan oop single": "Current Health Plan OOP (single)", "oop single": "Current Health Plan OOP (single)",
-        "out of pocket single": "Current Health Plan OOP (single)", "single oop": "Current Health Plan OOP (single)",
-        "current health plan oop family": "Current Health Plan OOP (family)", "oop family": "Current Health Plan OOP (family)",
-        "out of pocket family": "Current Health Plan OOP (family)", "family oop": "Current Health Plan OOP (family)",
-        "current health plan deductible single": "Current Health Plan Deductible (single)", "deductible single": "Current Health Plan Deductible (single)",
-        "single deductible": "Current Health Plan Deductible (single)",
-        "current health plan deductible family": "Current Health Plan Deductible (family)", "deductible family": "Current Health Plan Deductible (family)",
-        "family deductible": "Current Health Plan Deductible (family)",
-        "current health plan er cost": "Current Health Plan ER Cost", "health plan er cost": "Current Health Plan ER Cost",
-        "er cost": "Current Health Plan ER Cost", "employer cost": "Current Health Plan ER Cost", "employer contribution": "Current Health Plan ER Cost",
-        "current health plan ee cost": "Current Health Plan EE Cost", "health plan ee cost": "Current Health Plan EE Cost",
-        "ee cost": "Current Health Plan EE Cost", "employee cost": "Current Health Plan EE Cost", "employee contribution": "Current Health Plan EE Cost",
-        "annual salary": "Annual Salary", "salary": "Annual Salary", "yearly salary": "Annual Salary", "base salary": "Annual Salary",
-        "hourly rate": "Hourly Rate", "hourly": "Hourly Rate", "hourly wage": "Hourly Rate", "wage": "Hourly Rate",
-        "hours per week": "Hours Per Week", "hours week": "Hours Per Week", "hours/week": "Hours Per Week", "weekly hours": "Hours Per Week",
-        "notes": "Notes", "note": "Notes", "comments": "Notes", "remarks": "Notes",
-    }
-    for field_def in FIELDS:
-        aliases[norm_key(field_def.name)] = field_def.name
-        aliases[norm_key(field_def.col)] = field_def.name
-    return {norm_key(k): v for k, v in aliases.items()}
-
-
-HEADER_ALIASES = make_aliases()
-
-
-def similarity(a: str, b: str) -> int:
-    a_key = norm_key(a)
-    b_key = norm_key(b)
-    if not a_key or not b_key:
-        return 0
-    if RAPIDFUZZ_AVAILABLE:
-        return int(max(fuzz.ratio(a_key, b_key), fuzz.token_sort_ratio(a_key, b_key)))
-    a_set = set(a_key.split())
-    b_set = set(b_key.split())
-    if not a_set or not b_set:
-        return 0
-    return int(100 * len(a_set & b_set) / len(a_set | b_set))
-
-
-def map_columns(df: pd.DataFrame, options: EngineOptions) -> tuple[dict[str, str], list[str], list[str]]:
-    raw_headers = [str(c) for c in df.columns]
-    normalized = {str(c): norm_key(c) for c in df.columns}
-    mapping: dict[str, str] = {}
-    used: set[str] = set()
-    notes: list[str] = []
-
-    for col in raw_headers:
-        if options.strict_health_only and is_ancillary_header(col):
-            continue
-        alias = HEADER_ALIASES.get(normalized[col])
-        if alias and alias not in mapping:
-            mapping[alias] = col
-            used.add(col)
-
-    for field_def in FIELDS:
-        if field_def.name in mapping:
-            continue
-        best_col = ""
-        best_score = 0
-        for col in raw_headers:
-            if col in used:
-                continue
-            if options.strict_health_only and is_ancillary_header(col):
-                continue
-            score = similarity(field_def.name, col)
-            if score > best_score:
-                best_col = col
-                best_score = score
-        if best_col and best_score >= options.header_match_threshold:
-            mapping[field_def.name] = best_col
-            used.add(best_col)
-            notes.append(f"Fuzzy mapped '{best_col}' to '{field_def.name}' with score {best_score}.")
-
-    unrecognized = [c for c in raw_headers if c not in used]
-    return mapping, unrecognized, notes
-
-
-# =============================================================================
-# Value normalization and validation
-# =============================================================================
-
-
-RELATIONSHIP_ALIASES = {
-    "employee": "Employee", "ee": "Employee", "emp": "Employee", "self": "Employee", "subscriber": "Employee",
-    "primary": "Employee", "insured": "Employee", "member": "Employee",
-    "spouse": "Spouse", "sp": "Spouse", "sps": "Spouse", "spse": "Spouse", "husband": "Spouse", "wife": "Spouse",
-    "partner": "Spouse", "domestic partner": "Spouse", "registered domestic partner": "Spouse", "life partner": "Spouse",
-    "child": "Child", "ch": "Child", "dep": "Child", "dependent": "Child", "son": "Child", "daughter": "Child",
-    "stepchild": "Child", "step child": "Child", "stepson": "Child", "stepdaughter": "Child", "foster child": "Child",
+HEADER_ALIASES: dict[str, str] = {
+    # First / Last name
+    "first name": "First Name", "firstname": "First Name", "first": "First Name",
+    "given name": "First Name", "employee first name": "First Name", "ee first name": "First Name",
+    "member first name": "First Name", "subscriber first name": "First Name",
+    "last name": "Last Name", "lastname": "Last Name", "last": "Last Name",
+    "surname": "Last Name", "family name": "Last Name", "employee last name": "Last Name",
+    "ee last name": "Last Name", "member last name": "Last Name", "subscriber last name": "Last Name",
+    # Employee ID
+    "employee id": "Employee ID", "emp id": "Employee ID", "empid": "Employee ID",
+    "employee number": "Employee ID", "emp number": "Employee ID", "id": "Employee ID",
+    "employee #": "Employee ID", "ee #": "Employee ID", "ee number": "Employee ID",
+    "ee not ssn": "Employee ID", "employee not ssn": "Employee ID",
+    "employee # not ssn": "Employee ID", "worker id": "Employee ID", "person number": "Employee ID",
+    # Relationship
+    "relationship": "Relationship", "relation": "Relationship",
+    "relationship employee ee spouse sp or child ch": "Relationship",
+    "relationship employee spouse or child": "Relationship",
+    "dependent type": "Relationship", "member type": "Relationship", "covered person type": "Relationship",
+    # DOB
+    "dob": "DOB", "date of birth": "DOB", "birth date": "DOB", "birthdate": "DOB",
+    "date of birth mm dd yyyy": "DOB", "employee dob": "DOB", "employee date of birth": "DOB",
+    # Gender
+    "gender": "Gender", "gender m f": "Gender", "sex": "Gender",
+    # Email
+    "email": "Email", "email address": "Email", "e mail": "Email",
+    "work email": "Email", "personal email": "Email",
+    # Address
+    "address line 1": "Address Line 1", "address1": "Address Line 1", "street address": "Address Line 1",
+    "primary address line 1": "Address Line 1", "home address line 1": "Address Line 1", "address": "Address Line 1",
+    "address line 2": "Address Line 2", "address2": "Address Line 2", "apt": "Address Line 2",
+    "suite": "Address Line 2", "primary address line 2": "Address Line 2",
+    # City / State / Zip / County
+    "city": "City", "town": "City", "primary address city": "City", "home city": "City",
+    "state": "State", "st": "State", "state code": "State", "primary address state territory": "State",
+    "primary address state": "State", "home state": "State", "home state territory": "State",
+    "zip code": "Zip Code", "zip": "Zip Code", "zipcode": "Zip Code", "postal code": "Zip Code",
+    "primary address zip code": "Zip Code", "primary address postal code": "Zip Code", "home zip": "Zip Code",
+    "home zip code": "Zip Code",
+    "county": "County", "home county": "County", "primary address county": "County",
+    # Worksite
+    "primary worksite zip code": "Primary Worksite Zip Code", "worksite zip": "Primary Worksite Zip Code",
+    "work zip": "Primary Worksite Zip Code", "work zip code": "Primary Worksite Zip Code",
+    "worksite zip code": "Primary Worksite Zip Code",
+    "site zip": "Primary Worksite Zip Code", "work location zip": "Primary Worksite Zip Code",
+    "primary worksite county": "Primary Worksite County", "worksite county": "Primary Worksite County",
+    "work county": "Primary Worksite County", "work location county": "Primary Worksite County",
+    # Class
+    "ichra class": "ICHRA Class", "ichra": "ICHRA Class", "class": "ICHRA Class",
+    "benefit class": "ICHRA Class", "worker category": "ICHRA Class", "employee class": "ICHRA Class",
+    "employee class name or": "ICHRA Class", "location division": "ICHRA Class",
+    # Health Election
+    "health election": "Health Election", "election": "Health Election", "coverage election": "Health Election",
+    "medical election": "Health Election", "benefit election": "Health Election", "medical waive reason": "Health Election",
+    # Health plan fields
+    "current health vendor": "Current Health Plan Vendor", "current health plan vendor": "Current Health Plan Vendor",
+    "health vendor": "Current Health Plan Vendor", "medical vendor": "Current Health Plan Vendor",
+    "carrier": "Current Health Plan Vendor", "insurance carrier": "Current Health Plan Vendor",
+    "health carrier": "Current Health Plan Vendor", "medical carrier": "Current Health Plan Vendor",
+    "current health plan": "Current Health Plan", "health plan": "Current Health Plan",
+    "plan name": "Current Health Plan", "medical plan": "Current Health Plan", "medical plan name": "Current Health Plan",
+    "health plan name": "Current Health Plan", "current plan": "Current Health Plan",
+    "current health plan tier": "Current Health Plan Tier", "health plan tier": "Current Health Plan Tier",
+    "medical plan tier": "Current Health Plan Tier", "coverage tier": "Current Health Plan Tier",
+    "coverage level": "Current Health Plan Tier", "plan tier": "Current Health Plan Tier", "tier": "Current Health Plan Tier",
+    "medical coverage tier": "Current Health Plan Tier", "medical coverage level": "Current Health Plan Tier",
+    "current health plan oop single": "Current Health Plan OOP (single)", "health plan oop single": "Current Health Plan OOP (single)",
+    "oop single": "Current Health Plan OOP (single)", "out of pocket single": "Current Health Plan OOP (single)",
+    "current health plan oop family": "Current Health Plan OOP (family)", "health plan oop family": "Current Health Plan OOP (family)",
+    "oop family": "Current Health Plan OOP (family)", "out of pocket family": "Current Health Plan OOP (family)",
+    "current health plan deductible single": "Current Health Plan Deductible (single)", "health plan deductible single": "Current Health Plan Deductible (single)",
+    "deductible single": "Current Health Plan Deductible (single)",
+    "current health plan deductible family": "Current Health Plan Deductible (family)", "health plan deductible family": "Current Health Plan Deductible (family)",
+    "deductible family": "Current Health Plan Deductible (family)",
+    "current health plan er cost": "Current Health Plan ER Cost", "health plan er cost": "Current Health Plan ER Cost",
+    "medical er cost": "Current Health Plan ER Cost", "er cost": "Current Health Plan ER Cost",
+    "employer cost": "Current Health Plan ER Cost", "employer contribution": "Current Health Plan ER Cost",
+    "current health plan ee cost": "Current Health Plan EE Cost", "health plan ee cost": "Current Health Plan EE Cost",
+    "medical ee cost": "Current Health Plan EE Cost", "ee cost": "Current Health Plan EE Cost",
+    "employee cost": "Current Health Plan EE Cost", "employee contribution": "Current Health Plan EE Cost",
+    # Compensation
+    "annual salary": "Annual Salary", "salary": "Annual Salary", "yearly salary": "Annual Salary", "base salary": "Annual Salary",
+    "hourly rate": "Hourly Rate", "hourly": "Hourly Rate", "rate": "Hourly Rate", "hourly wage": "Hourly Rate",
+    "hours per week": "Hours Per Week", "hours week": "Hours Per Week", "weekly hours": "Hours Per Week",
+    "weekly hours worked": "Hours Per Week", "hours worked": "Hours Per Week", "hrs per week": "Hours Per Week",
+    # Notes
+    "notes": "Notes", "note": "Notes", "comments": "Notes", "comment": "Notes", "remarks": "Notes",
+    **{col.lower(): f["name"] for col, f in zip(
+        ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O",
+         "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z", "AA", "AB", "AC", "AD"], FIELDS
+    )},
 }
 
-ELECTION_ENROLL = {"enroll", "e", "yes", "y", "enrolled", "active", "participating", "covered", "elect", "elected"}
-ELECTION_WAIVE = {"waive", "w", "no", "n", "waived", "decline", "declined", "not enrolled", "opt out", "opt-out", "waiving"}
+# =============================================================================
+# 3. VALUE NORMALISATION
+# =============================================================================
 
-TIER_ALIASES = {
-    "employee only": "Employee Only", "ee only": "Employee Only", "eo": "Employee Only", "single": "Employee Only",
-    "individual": "Employee Only", "employee": "Employee Only", "ee": "Employee Only", "employee-only": "Employee Only",
-    "employee spouse": "Employee + Spouse", "employee plus spouse": "Employee + Spouse", "employee sp": "Employee + Spouse",
-    "ee spouse": "Employee + Spouse", "ee plus spouse": "Employee + Spouse", "ee sp": "Employee + Spouse", "es": "Employee + Spouse",
-    "employee child": "Employee + Children", "employee children": "Employee + Children", "employee plus child": "Employee + Children",
-    "employee plus children": "Employee + Children", "ee child": "Employee + Children", "ee children": "Employee + Children",
-    "ee plus child": "Employee + Children", "ee plus children": "Employee + Children", "ec": "Employee + Children", "ech": "Employee + Children",
-    "employee children only": "Employee + Children", "employee child ren": "Employee + Children",
-    "family": "Family", "fam": "Family", "employee family": "Family", "ee family": "Family", "ef": "Family",
-    "employee spouse children": "Family", "employee plus spouse children": "Family", "ee spouse children": "Family",
-}
+_RELATIONSHIP_MAP: dict[str, str] = {}
+
+def _add_rel(canonical: str, *aliases: str) -> None:
+    for a in aliases:
+        _RELATIONSHIP_MAP[_norm(a)] = canonical
+
+_add_rel("Employee", "employee", "ee", "emp", "subscriber", "self", "primary", "insured", "member", "worker")
+_add_rel("Spouse", "spouse", "sp", "husband", "wife", "partner", "domestic partner", "life partner",
+         "registered domestic partner", "common law spouse", "common law partner", "DomesticPartner", "domesticpartner", "spse", "sps")
+_add_rel("Child", "child", "ch", "dependent", "dep", "daughter", "son", "stepchild", "step child",
+         "adopted child", "foster child", "stepson", "stepdaughter", "child of domestic partner", "child child")
+
+_ELECTION_ENROLL = {"enroll", "e", "yes", "y", "enrolled", "participating", "active", "covered", "elect", "elected", "ee", "eo", "es", "ec", "ech", "eech", "ef", "fa", "fam"}
+_ELECTION_WAIVE = {"waive", "w", "wp", "ie", "no", "n", "waived", "decline", "declined", "opt out", "optout", "not participating", "waiving", "waiting period", "in waiting period", "ineligible"}
+
+_TIER_EMP_ONLY = {"employee only", "employee", "ee only", "employee only coverage", "single", "individual", "self only"}
+_TIER_EMP_SPOUSE = {"employee spouse", "employee and spouse", "employee + spouse", "ee spouse", "ee + spouse", "ee sp", "employee plus spouse"}
+_TIER_EMP_CHILDREN = {"employee children", "employee child", "employee + children", "employee + child", "ee children", "ee child", "ee + children", "ee + child", "employee plus children", "parent child", "parent children"}
+_TIER_FAMILY = {"family", "employee family", "employee + family", "ee family", "ee + family", "employee spouse children", "employee + spouse + children", "employee spouse child", "ee spouse children", "ee + spouse + children"}
+_TIER_WAIVE = {"waive", "waived", "decline", "declined", "no coverage", "none", "not enrolled", "no election"}
 
 
-def normalize_relationship(value: Any, threshold: int = 86) -> tuple[str, Optional[str]]:
-    original = cell(value)
-    key = norm_key(original)
+def normalize_relationship(v: object) -> tuple[str, Optional[str]]:
+    original = str(v or "").strip()
+    key = _norm(original.replace("|", " "))
     if not key:
         return "", None
-    if key in RELATIONSHIP_ALIASES:
-        normalized = RELATIONSHIP_ALIASES[key]
-        note = None if normalized.lower() == key else f"Relationship normalized from '{original}' to '{normalized}'."
-        return normalized, note
-    best_alias = ""
-    best_score = 0
-    for alias in RELATIONSHIP_ALIASES:
-        score = similarity(key, alias)
-        if score > best_score:
-            best_alias = alias
-            best_score = score
-    if best_alias and best_score >= threshold:
-        normalized = RELATIONSHIP_ALIASES[best_alias]
-        return normalized, f"Relationship fuzzy matched from '{original}' to '{normalized}' with score {best_score}."
+    if key in _RELATIONSHIP_MAP:
+        canonical = _RELATIONSHIP_MAP[key]
+        note = f"Relationship normalised: '{original}' → '{canonical}'" if canonical.lower() != original.lower() else None
+        return canonical, note
+    if FUZZY_AVAILABLE:
+        match = rf_process.extractOne(key, _RELATIONSHIP_MAP.keys(), scorer=fuzz.ratio)
+        if match:
+            best, score, _ = match
+            if score >= 82:
+                canonical = _RELATIONSHIP_MAP[best]
+                return canonical, f"Relationship fuzzy-matched: '{original}' → '{canonical}' (score {score})"
     return original, None
 
 
-def normalize_election(value: Any) -> tuple[str, Optional[str]]:
-    original = cell(value)
-    key = norm_key(original)
+def normalize_election(v: object) -> tuple[str, Optional[str]]:
+    original = str(v or "").strip()
+    key = _norm(original)
     if not key:
         return "", None
-    if key in ELECTION_ENROLL:
-        return "Enroll", None if original == "Enroll" else f"Health Election normalized from '{original}' to 'Enroll'."
-    if key in ELECTION_WAIVE:
-        return "Waive", None if original == "Waive" else f"Health Election normalized from '{original}' to 'Waive'."
-    return original, None
+    if key in _ELECTION_ENROLL:
+        canonical = "Enroll"
+    elif key in _ELECTION_WAIVE:
+        canonical = "Waive"
+    else:
+        return original, None
+    note = f"Health Election normalised: '{original}' → '{canonical}'" if original != canonical else None
+    return canonical, note
 
 
-def normalize_tier(value: Any) -> tuple[str, Optional[str]]:
-    original = cell(value)
-    key = norm_key(original).replace(" + ", " ")
-    key = key.replace("plus", " plus ")
+def normalize_tier(v: object) -> tuple[str, Optional[str]]:
+    original = str(v or "").strip()
+    key = _norm(original.replace("&", " and ").replace("/", " ").replace("-", " "))
+    key = key.replace(" plus ", " ").replace(" and ", " ")
     key = re.sub(r"\s+", " ", key).strip()
     if not key:
         return "", None
-    compact = key.replace(" ", "")
-    candidates = {key, compact}
-    for candidate in candidates:
-        if candidate in TIER_ALIASES:
-            normalized = TIER_ALIASES[candidate]
-            return normalized, None if original == normalized else f"Current Health Plan Tier normalized from '{original}' to '{normalized}'."
-    if ("spouse" in key or "sp" in key) and ("child" in key or "children" in key or "family" in key):
-        return "Family", f"Current Health Plan Tier normalized from '{original}' to 'Family'."
-    if "spouse" in key or re.search(r"\bsp\b", key):
-        return "Employee + Spouse", f"Current Health Plan Tier normalized from '{original}' to 'Employee + Spouse'."
-    if "child" in key or "children" in key or re.search(r"\bch\b", key):
-        return "Employee + Children", f"Current Health Plan Tier normalized from '{original}' to 'Employee + Children'."
-    if "family" in key or key == "fam":
-        return "Family", f"Current Health Plan Tier normalized from '{original}' to 'Family'."
+
+    def _hit(options: set[str]) -> bool:
+        return key in {_norm(o).replace(" and ", " ").replace(" plus ", " ") for o in options}
+
+    # Common carrier/export abbreviations.
+    compact = _compact(original)
+    abbreviation_map = {
+        "eo": "Employee Only",
+        "ee": "Employee Only",
+        "e": "Employee Only",
+        "es": "Employee + Spouse",
+        "ec": "Employee + Children",
+        "ech": "Employee + Children",
+        "eech": "Employee + Children",
+        "ef": "Family",
+        "fa": "Family",
+        "fam": "Family",
+    }
+    if compact in abbreviation_map:
+        canonical = abbreviation_map[compact]
+        note = f"Tier normalised: '{original}' -> '{canonical}'" if original != canonical else None
+        return canonical, note
+
+    # Keyword fallback catches common employer exports like "EE + Child(ren)".
+    if _hit(_TIER_WAIVE) or any(x in compact for x in ["waive", "decline", "nocoverage"]):
+        return "Waive", f"Tier normalised: '{original}' → 'Waive'" if original != "Waive" else None
+    if _hit(_TIER_FAMILY) or "family" in compact or ("spouse" in compact and ("child" in compact or "children" in compact)):
+        return "Family", f"Tier normalised: '{original}' → 'Family'" if original != "Family" else None
+    if _hit(_TIER_EMP_SPOUSE) or ("spouse" in compact and "child" not in compact and "children" not in compact):
+        return "Employee + Spouse", f"Tier normalised: '{original}' → 'Employee + Spouse'" if original != "Employee + Spouse" else None
+    if _hit(_TIER_EMP_CHILDREN) or "child" in compact or "children" in compact:
+        return "Employee + Children", f"Tier normalised: '{original}' → 'Employee + Children'" if original != "Employee + Children" else None
+    if _hit(_TIER_EMP_ONLY) or compact in {"ee", "eo", "employeeonly", "selfonly", "individual"}:
+        return "Employee Only", f"Tier normalised: '{original}' → 'Employee Only'" if original != "Employee Only" else None
     return original, None
 
 
-def normalize_zip(value: Any) -> tuple[str, Optional[str], Optional[str]]:
-    original = cell(value)
-    if not original:
-        return "", None, None
-    if original.upper() in US_STATE_CODES:
-        return original, None, f"Zip field looks like a state abbreviation, not a zip code: '{original}'."
-    digits = re.sub(r"\D", "", original)
-    if len(digits) >= 9:
-        fixed = f"{digits[:5]}-{digits[5:9]}"
-    elif 0 < len(digits) < 5:
-        fixed = digits.zfill(5)
-    elif len(digits) == 5:
-        fixed = digits
-    else:
-        return original, None, f"Zip Code must be 5 digits or ZIP+4, got '{original}'."
-    note = None if fixed == original else f"Zip normalized from '{original}' to '{fixed}'."
-    return fixed, note, None
+def dependent_election_from_tier(employee_election: str, tier: str, relationship: str) -> str:
+    if employee_election == "Waive" or tier == "Waive":
+        return "Waive"
+    if relationship == "Employee":
+        return employee_election or "Enroll"
+    if tier == "Employee Only":
+        return "Waive"
+    if tier == "Employee + Spouse":
+        return "Enroll" if relationship == "Spouse" else "Waive"
+    if tier == "Employee + Children":
+        return "Enroll" if relationship == "Child" else "Waive"
+    if tier == "Family":
+        return "Enroll"
+    return employee_election or "Enroll"
 
 
-def normalize_numeric(value: Any) -> tuple[str, Optional[str], Optional[str]]:
-    original = cell(value)
-    if not original:
-        return "", None, None
-    cleaned = original.replace("$", "").replace(",", "").replace("%", "").strip()
-    cleaned = re.sub(r"\s+", "", cleaned)
-    if not re.match(r"^-?\d+(\.\d+)?$", cleaned):
-        return original, None, f"Numeric field must be numeric, got '{original}'."
-    note = None if cleaned == original else f"Numeric formatting stripped from '{original}' to '{cleaned}'."
-    return cleaned, note, None
+def _tier_from_election_code(value: object) -> tuple[str, Optional[str]]:
+    """Return a coverage tier when a carrier election code is used as the election value."""
+    original = str(value or "").strip()
+    compact = _compact(original)
+    if compact not in {"ee", "eo", "es", "ec", "ech", "eech", "ef", "fa", "fam"}:
+        return "", None
+    tier, note = normalize_tier(original)
+    if tier and tier != "Waive":
+        return tier, f"Coverage tier derived from medical election code '{original}' -> '{tier}'"
+    return "", note
 
-
-def normalize_date(value: Any) -> tuple[str, Optional[str], Optional[str]]:
-    original = cell(value)
-    if not original:
-        return "", None, None
-    if re.match(r"^\d+(\.0)?$", original):
-        try:
-            serial = float(original)
-            if 1 <= serial <= 60000:
-                dt = pd.to_datetime(serial, unit="D", origin="1899-12-30", errors="coerce")
-                if not pd.isna(dt):
-                    fixed = dt.strftime("%m/%d/%Y")
-                    return fixed, f"Excel serial date converted from '{original}' to '{fixed}'.", None
-        except Exception:
-            pass
-    parsed = pd.to_datetime(original, errors="coerce")
-    if pd.isna(parsed):
-        return original, None, f"Invalid date format '{original}'. Expected mm/dd/yyyy."
-    fixed = parsed.strftime("%m/%d/%Y")
-    note = None if fixed == original else f"Date normalized from '{original}' to '{fixed}'."
-    return fixed, note, None
-
-
-def validate_field(field_def: FieldDef, value: Any, options: EngineOptions) -> tuple[str, list[str], list[str]]:
-    raw = cell(value)
-    notes: list[str] = []
-    errors: list[str] = []
-
-    if field_def.required and not raw:
-        return "", notes, [f"{field_def.name} is required."]
-    if not raw:
-        return "", notes, errors
-
-    if field_def.kind == "relationship":
-        fixed, note = normalize_relationship(raw, options.relationship_match_threshold)
-        if note:
-            notes.append(note)
-        if fixed not in {"Employee", "Spouse", "Child"}:
-            errors.append(f"Invalid Relationship '{raw}'. Expected Employee, Spouse, or Child.")
-        return fixed, notes, errors
-
-    if field_def.kind == "election":
-        fixed, note = normalize_election(raw)
-        if note:
-            notes.append(note)
-        if fixed not in {"Enroll", "Waive"}:
-            errors.append(f"Invalid Health Election '{raw}'. Expected Enroll or Waive.")
-        return fixed, notes, errors
-
-    if field_def.kind == "tier":
-        fixed, note = normalize_tier(raw)
-        if note:
-            notes.append(note)
-        if fixed not in field_def.values:
-            errors.append(f"Invalid Current Health Plan Tier '{raw}'. Expected Employee Only, Employee + Spouse, Employee + Children, or Family.")
-        return fixed, notes, errors
-
-    if field_def.kind == "zipcode":
-        fixed, note, err = normalize_zip(raw)
-        if note:
-            notes.append(note)
-        if err:
-            errors.append(err)
-        return fixed, notes, errors
-
-    if field_def.kind == "date":
-        fixed, note, err = normalize_date(raw)
-        if note:
-            notes.append(note)
-        if err:
-            errors.append(err)
-        return fixed, notes, errors
-
-    if field_def.kind == "numeric":
-        fixed, note, err = normalize_numeric(raw)
-        if note:
-            notes.append(note)
-        if err:
-            errors.append(err)
-        return fixed, notes, errors
-
-    return raw, notes, errors
 
 
 # =============================================================================
-# County lookup
+# 4. ZIP CODE LOOKUP
 # =============================================================================
-
 
 @st.cache_data(show_spinner=False)
 def build_zip_cache() -> dict[str, dict[str, str]]:
     if not ZIPCODES_AVAILABLE:
         return {}
     cache: dict[str, dict[str, str]] = {}
-    for item in zipcodes_pkg.list_all():
-        z = item.get("zip_code", "")
-        county = cell(item.get("county", "")).replace(" County", "")
-        if z and z not in cache:
-            cache[z] = {"county": county, "state": item.get("state", "")}
+    for entry in _zc.list_all():
+        z = str(entry.get("zip_code", "")).strip()
+        state = str(entry.get("state", "")).strip().upper()
+        zip_type = str(entry.get("zip_code_type", "")).strip().upper()
+        active = bool(entry.get("active", True))
+
+        if not z or z in KNOWN_INVALID_OR_UNSUPPORTED_ZIPS:
+            continue
+        if state not in SUPPORTED_ZIP_STATES:
+            continue
+        if not active:
+            continue
+        if zip_type and zip_type != "STANDARD":
+            continue
+
+        if z not in cache:
+            county_raw = str(entry.get("county") or "")
+            county = county_raw.replace(" County", "").strip()
+            cache[z] = {"abbr": state, "county": county}
     return cache
 
 
-def lookup_county(zip_value: str, zip_cache: dict[str, dict[str, str]]) -> str:
-    if not zip_value or not zip_cache:
+def _pad_zip(z: object) -> str:
+    """Normalize U.S. ZIP values to a 5-digit ZIP code.
+
+    Converts clear U.S. numeric ZIP formats only:
+    - 525718303 -> 52571
+    - 52571-8303 -> 52571
+    - 52571 8303 -> 52571
+    - 601 -> 00601
+    - 601.0 -> 00601
+
+    Alphanumeric postal codes, such as Canadian postal codes, are returned
+    unchanged so validation can flag them instead of stripping digits.
+    """
+    v = str(z or "").strip().upper()
+    if not v:
         return ""
-    five = re.sub(r"\D", "", zip_value)[:5]
-    return zip_cache.get(five, {}).get("county", "")
 
+    # Excel sometimes stores numeric ZIPs as 601.0 or 525718303.0.
+    if re.fullmatch(r"\d+\.0", v):
+        v = v[:-2]
+
+    # Do not strip digits from non-U.S. alphanumeric postal codes.
+    # Example: T8A2A4 should remain T8A2A4 and be flagged.
+    if re.search(r"[A-Z]", v):
+        return v
+
+    # Accept only numeric ZIP, ZIP+4, or numeric ZIP+4 with spaces.
+    compact = re.sub(r"[\s-]", "", v)
+    if re.fullmatch(r"\d{9}", compact):
+        return compact[:5]
+    if re.fullmatch(r"\d{5}", compact):
+        return compact
+    if re.fullmatch(r"\d{1,4}", compact):
+        return compact.zfill(5)
+
+    return v
+
+
+def lookup_zip(zip_raw: object, cache: dict[str, dict[str, str]]) -> Optional[dict[str, str]]:
+    return cache.get(_pad_zip(zip_raw)[:5])
 
 # =============================================================================
-# Horizontal census conversion
+# 5. FILE INGESTION
 # =============================================================================
 
-
-def find_column(df: pd.DataFrame, patterns: Iterable[str], *, exclude_ancillary: bool = True) -> str:
-    for col in df.columns:
-        if exclude_ancillary and is_ancillary_header(col):
-            continue
-        key = norm_key(col)
-        if all(token in key for token in patterns):
-            return str(col)
-    return ""
-
-
-def find_any_column(df: pd.DataFrame, pattern_sets: Iterable[Iterable[str]], *, exclude_ancillary: bool = True) -> str:
-    for patterns in pattern_sets:
-        found = find_column(df, patterns, exclude_ancillary=exclude_ancillary)
-        if found:
-            return found
-    return ""
+# Encodings to try, in order. utf-8-sig handles BOM-prefixed UTF-8 (common from
+# Excel "CSV UTF-8" exports). cp1252 / latin-1 handle the classic Windows export
+# case where curly quotes, em-dashes, etc. show up as bytes like 0x92, which are
+# not valid UTF-8 and otherwise throw UnicodeDecodeError.
+CANDIDATE_ENCODINGS = ["utf-8-sig", "utf-8", "cp1252", "latin-1"]
+HEADER_SCAN_MAX_ROWS = 100
+MIN_HEADER_SCORE = 10
+MIN_HEADER_MATCHES = 4
 
 
-def find_dependent_columns(df: pd.DataFrame) -> dict[str, list[dict[str, str]]]:
-    spouse_sets: list[dict[str, str]] = []
-    child_sets: list[dict[str, str]] = []
-    columns = [str(c) for c in df.columns]
-
-    spouse_first = find_any_column(df, [["spouse", "first"], ["sp", "first"]])
-    spouse_last = find_any_column(df, [["spouse", "last"], ["sp", "last"]])
-    spouse_dob = find_any_column(df, [["spouse", "dob"], ["spouse", "birth"], ["sp", "dob"]])
-    if spouse_dob:
-        spouse_sets.append({"relationship": "Spouse", "first": spouse_first, "last": spouse_last, "dob": spouse_dob})
-
-    child_indexes: set[str] = set()
-    for col in columns:
-        key = norm_key(col)
-        if "child" not in key and not re.search(r"\bch\s*\d+\b", key):
-            continue
-        match = re.search(r"(?:child|ch)\s*(\d+)", key)
-        child_indexes.add(match.group(1) if match else "1")
-
-    for idx in sorted(child_indexes, key=lambda x: int(x) if x.isdigit() else 999):
-        first = find_any_column(df, [["child", idx, "first"], ["ch", idx, "first"], ["child", "first"]])
-        last = find_any_column(df, [["child", idx, "last"], ["ch", idx, "last"], ["child", "last"]])
-        dob = find_any_column(df, [["child", idx, "dob"], ["child", idx, "birth"], ["ch", idx, "dob"], ["child", "dob"]])
-        if dob and not any(existing["dob"] == dob for existing in child_sets):
-            child_sets.append({"relationship": "Child", "first": first, "last": last, "dob": dob})
-
-    return {"spouse": spouse_sets, "child": child_sets}
+def _clean_header_label(value: object) -> str:
+    """Return a single-line, import-safe column header label."""
+    label = str(value or "").replace("\ufeff", " ").replace("\n", " ").replace("\r", " ").strip()
+    label = re.sub(r"\s+", " ", label)
+    return label
 
 
-def detect_horizontal(df: pd.DataFrame, mapping: dict[str, str], options: EngineOptions) -> tuple[bool, str]:
-    if options.input_mode == InputMode.VERTICAL:
-        return False, "Input mode forced to vertical."
-    if options.input_mode == InputMode.HORIZONTAL:
-        return True, "Input mode forced to horizontal."
-
-    headers = " ".join(norm_key(c) for c in df.columns)
-    dep_header_score = 0
-    for term in ["spouse", "child", "dependent", "dep dob", "member dob", "relationship"]:
-        if term in headers:
-            dep_header_score += 1
-
-    rel_col = mapping.get("Relationship", "")
-    vertical_relationships = 0
-    if rel_col and rel_col in df.columns:
-        values = df[rel_col].astype(str).map(norm_key)
-        vertical_relationships = int(values.isin({"employee", "spouse", "child", "dependent", "dep", "ee", "self"}).sum())
-
-    if dep_header_score >= max(2, options.horizontal_detection_sensitivity):
-        return True, f"Dependent-oriented headers detected with score {dep_header_score}."
-    if not rel_col and ("spouse" in headers or "child" in headers or "dependent" in headers):
-        return True, "No standard relationship column was found and dependent headers are present."
-    if rel_col and "employee dob" in headers and ("dependent dob" in headers or "spouse dob" in headers or "child dob" in headers):
-        return True, "Row-wise horizontal layout detected."
-    if vertical_relationships == 0 and ("medical" in headers or "health" in headers) and ("tier" in headers or "coverage" in headers):
-        return True, "No vertical relationships found and health tier fields are present."
-    return False, "Standard vertical layout detected."
+def _is_ancillary_header_label(value: object) -> bool:
+    h = _norm(value)
+    return any(term in h.split() or term in h for term in ANCILLARY_TERMS)
 
 
-def empty_output_row() -> dict[str, str]:
-    return {col: "" for col in OUTPUT_COLUMNS}
+def _infer_canonical_header_name(value: object) -> Optional[str]:
+    """Infer the canonical CSA field represented by a raw header cell.
 
-
-def employee_group_key(row: pd.Series, mapping: dict[str, str], row_number: int) -> str:
-    emp_id = row_value(row, mapping.get("Employee ID"))
-    if emp_id:
-        return f"id:{emp_id}"
-    first = row_value(row, mapping.get("First Name"))
-    last = row_value(row, mapping.get("Last Name"))
-    dob = row_value(row, mapping.get("DOB"))
-    zip_code = row_value(row, mapping.get("Zip Code"))
-    if first or last or dob:
-        return f"person:{norm_key(first)}:{norm_key(last)}:{norm_key(dob)}:{norm_key(zip_code)}"
-    return f"row:{row_number}"
-
-
-def should_skip_horizontal_row(row: pd.Series, options: EngineOptions) -> bool:
-    if not options.exclude_interns_contractors_inactive:
-        return False
-    combined = " ".join(norm_key(v) for v in row.values)
-    skip_terms = {"intern", "contractor", "terminated", "inactive", "seasonal ineligible", "not eligible"}
-    return any(term in combined for term in skip_terms)
-
-
-def infer_employee_election(row: pd.Series, mapping: dict[str, str]) -> str:
-    raw = row_value(row, mapping.get("Health Election"))
-    election, _ = normalize_election(raw)
-    if election in {"Enroll", "Waive"}:
-        return election
-    tier, _ = normalize_tier(row_value(row, mapping.get("Current Health Plan Tier")))
-    plan = row_value(row, mapping.get("Current Health Plan"))
-    vendor = row_value(row, mapping.get("Current Health Plan Vendor"))
-    if tier or plan or vendor:
-        return "Enroll"
-    return "Waive"
-
-
-def dependent_election(relationship: str, employee_election: str, tier: str, options: EngineOptions, has_medical_plan: bool) -> str:
-    if employee_election == "Waive":
-        return "Waive"
-    normalized_tier, _ = normalize_tier(tier)
-    if normalized_tier == "Employee Only":
-        return "Waive"
-    if normalized_tier == "Employee + Spouse":
-        return "Enroll" if relationship == "Spouse" else "Waive"
-    if normalized_tier == "Employee + Children":
-        return "Enroll" if relationship == "Child" else "Waive"
-    if normalized_tier == "Family":
-        return "Enroll"
-    if options.infer_dependents_enrolled_when_tier_missing and has_medical_plan and employee_election == "Enroll":
-        return "Enroll"
-    return "Waive"
-
-
-def build_employee_row(row: pd.Series, mapping: dict[str, str], sequence: int, options: EngineOptions) -> dict[str, str]:
-    out = empty_output_row()
-    for field_def in FIELDS:
-        if field_def.name in CLEARED_FIELDS:
-            continue
-        raw = row_value(row, mapping.get(field_def.name))
-        out[field_def.name] = raw
-
-    if not out["First Name"] and options.auto_placeholder_names:
-        out["First Name"] = f"Employee{sequence}"
-    if not out["Last Name"] and options.auto_placeholder_names:
-        out["Last Name"] = "Placeholder"
-    out["Relationship"] = "Employee"
-    out["Health Election"] = infer_employee_election(row, mapping)
-    return out
-
-
-def build_dependent_row(
-    employee_row: dict[str, str],
-    relationship: str,
-    dob: str,
-    first_name: str,
-    last_name: str,
-    sequence: int,
-    dep_sequence: int,
-    employee_election: str,
-    tier: str,
-    options: EngineOptions,
-) -> dict[str, str]:
-    out = empty_output_row()
-    out["First Name"] = first_name or (f"{relationship}{dep_sequence}" if options.auto_placeholder_names else "")
-    out["Last Name"] = last_name or employee_row.get("Last Name", "") or ("Placeholder" if options.auto_placeholder_names else "")
-    out["Relationship"] = relationship
-    out["DOB"] = dob
-    out["Zip Code"] = employee_row.get("Zip Code", "")
-    out["County"] = employee_row.get("County", "")
-    if options.inherit_worksite_zip_to_dependents:
-        out["Primary Worksite Zip Code"] = employee_row.get("Primary Worksite Zip Code", "") or employee_row.get("Zip Code", "")
-        out["Primary Worksite County"] = employee_row.get("Primary Worksite County", "") or employee_row.get("County", "")
-    out["ICHRA Class"] = employee_row.get("ICHRA Class", "")
-    has_medical_plan = bool(employee_row.get("Current Health Plan") or employee_row.get("Current Health Plan Vendor") or employee_row.get("Current Health Plan Tier"))
-    out["Health Election"] = dependent_election(relationship, employee_election, tier, options, has_medical_plan)
-    return out
-
-
-def extract_rowwise_dependent(row: pd.Series, mapping: dict[str, str], options: EngineOptions) -> Optional[dict[str, str]]:
-    rel_raw = row_value(row, mapping.get("Relationship"))
-    relationship, _ = normalize_relationship(rel_raw, options.relationship_match_threshold)
-
-    dep_dob_col = find_any_column(pd.DataFrame(columns=row.index), [["dependent", "dob"], ["dependent", "birth"], ["member", "dob"], ["spouse", "dob"], ["child", "dob"]])
-    dep_first_col = find_any_column(pd.DataFrame(columns=row.index), [["dependent", "first"], ["member", "first"], ["spouse", "first"], ["child", "first"]])
-    dep_last_col = find_any_column(pd.DataFrame(columns=row.index), [["dependent", "last"], ["member", "last"], ["spouse", "last"], ["child", "last"]])
-
-    dep_dob = row_value(row, dep_dob_col)
-    if not dep_dob and relationship in {"Spouse", "Child"}:
-        dep_dob = row_value(row, mapping.get("DOB"))
-    if not dep_dob:
+    This is intentionally conservative. It is used for header-row detection and
+    as a fallback in column mapping when exports include long instructional
+    labels like "Relationship Employee (EE), Spouse (SP), or Child (CH)".
+    """
+    label = _clean_header_label(value)
+    h = _norm(label)
+    if not h:
         return None
 
-    if relationship not in {"Spouse", "Child"}:
-        header_text = " ".join(norm_key(c) for c in row.index)
-        if "spouse" in header_text:
-            relationship = "Spouse"
-        elif "child" in header_text or "dependent" in header_text:
-            relationship = "Child"
-        else:
-            relationship = "Child"
+    exact = HEADER_ALIASES.get(h)
+    if exact:
+        return exact
 
+    # Avoid mapping dental / vision / life / disability elections into health fields.
+    ancillary = _is_ancillary_header_label(h)
+
+    # Name and ID fields.
+    if "first" in h and "name" in h and "dependent" not in h and "child" not in h and "spouse" not in h:
+        return "First Name"
+    if "last" in h and "name" in h and "dependent" not in h and "child" not in h and "spouse" not in h:
+        return "Last Name"
+    if (("employee" in h or re.search(r"\bee\b", h)) and ("id" in h or "number" in h or "#" in label or "not ssn" in h)):
+        return "Employee ID"
+
+    # Relationship / DOB / demographic fields.
+    if "relationship" in h or "relation" in h or "covered person type" in h or "member type" in h:
+        return "Relationship"
+    if ("date of birth" in h or "birth date" in h or "birthdate" in h or re.search(r"\bdob\b", h)) and "dependent" not in h:
+        return "DOB"
+    if h.startswith("gender") or h == "sex" or h.startswith("sex "):
+        return "Gender"
+
+    # Home address fields.
+    if "address" in h and ("line 1" in h or h == "address" or "street" in h):
+        return "Address Line 1"
+    if "address" in h and ("line 2" in h or "apt" in h or "suite" in h):
+        return "Address Line 2"
+    if "city" in h and "work" not in h:
+        return "City"
+    if "state" in h and "work" not in h:
+        return "State"
+    if ("zip" in h or "postal" in h) and not any(x in h for x in ["work", "worksite", "site", "location"]):
+        return "Zip Code"
+    if "county" in h and not any(x in h for x in ["work", "worksite", "site", "location"]):
+        return "County"
+
+    # Worksite fields.
+    if ("zip" in h or "postal" in h) and any(x in h for x in ["work", "worksite", "site", "location"]):
+        return "Primary Worksite Zip Code"
+    if "county" in h and any(x in h for x in ["work", "worksite", "site", "location"]):
+        return "Primary Worksite County"
+
+    # Class and compensation.
+    if "ichra" in h or "employee class" in h or "benefit class" in h or h == "class" or "worker category" in h:
+        return "ICHRA Class"
+    if "annual" in h and "salary" in h:
+        return "Annual Salary"
+    if "salary" in h and "annual" not in h:
+        return "Annual Salary"
+    if "hourly" in h and ("rate" in h or "wage" in h):
+        return "Hourly Rate"
+    if "hours" in h and ("week" in h or "weekly" in h or "worked" in h):
+        return "Hours Per Week"
+
+    # Health election / plan fields. Ancillary headers are intentionally ignored.
+    if not ancillary:
+        if ("health" in h or "medical" in h or h == "election") and "election" in h:
+            return "Health Election"
+        if ("health" in h or "medical" in h or "plan" in h or "carrier" in h) and any(x in h for x in ["vendor", "carrier", "insurance carrier"]):
+            return "Current Health Plan Vendor"
+        if ("health" in h or "medical" in h or "plan" in h or "product" in h) and any(x in h for x in ["plan name", "product name", "current plan"]):
+            return "Current Health Plan"
+        if ("health" in h or "medical" in h or "coverage" in h or "benefit" in h or "tier" in h) and any(x in h for x in ["tier", "coverage level", "coverage tier", "benefit tier"]):
+            return "Current Health Plan Tier"
+        if "oop" in h or "out of pocket" in h:
+            return "Current Health Plan OOP (family)" if "family" in h else "Current Health Plan OOP (single)"
+        if "deductible" in h:
+            return "Current Health Plan Deductible (family)" if "family" in h else "Current Health Plan Deductible (single)"
+        if ("er cost" in h or "employer cost" in h or "employer contribution" in h) and not ancillary:
+            return "Current Health Plan ER Cost"
+        if ("ee cost" in h or "employee cost" in h or "employee contribution" in h) and not ancillary:
+            return "Current Health Plan EE Cost"
+
+    if h in {"notes", "note", "comments", "comment", "remarks"}:
+        return "Notes"
+    return None
+
+
+def _make_unique_columns(headers: list[object]) -> list[str]:
+    seen: dict[str, int] = {}
+    cleaned: list[str] = []
+    for idx, value in enumerate(headers):
+        label = _clean_header_label(value)
+        if not label:
+            label = f"Unnamed Column {idx + 1}"
+        count = seen.get(label, 0)
+        seen[label] = count + 1
+        cleaned.append(label if count == 0 else f"{label}.{count + 1}")
+    return cleaned
+
+
+def _score_possible_header_row(row_values: list[object]) -> tuple[int, set[str]]:
+    matches: set[str] = set()
+    score = 0
+    for value in row_values:
+        canonical = _infer_canonical_header_name(value)
+        if not canonical:
+            continue
+        matches.add(canonical)
+        score += 3
+        if canonical in {"First Name", "Last Name", "Relationship", "DOB", "Zip Code", "Primary Worksite Zip Code", "Health Election"}:
+            score += 2
+    # Reward broad coverage of the import schema rather than repeated matches.
+    score += len(matches) * 2
+    if {"Relationship", "DOB"}.issubset(matches):
+        score += 4
+    if {"Zip Code", "Primary Worksite Zip Code"}.issubset(matches):
+        score += 3
+    return score, matches
+
+
+def _detect_header_row_index(raw_df: pd.DataFrame) -> Optional[int]:
+    if raw_df.empty:
+        return None
+    best_idx: Optional[int] = None
+    best_score = -1
+    best_matches: set[str] = set()
+    scan_limit = min(len(raw_df), HEADER_SCAN_MAX_ROWS)
+
+    for idx in range(scan_limit):
+        row_values = raw_df.iloc[idx].tolist()
+        if not any(str(v).strip() for v in row_values):
+            continue
+        score, matches = _score_possible_header_row(row_values)
+        if score > best_score:
+            best_idx = idx
+            best_score = score
+            best_matches = matches
+
+    if best_idx is None:
+        return None
+    if best_score >= MIN_HEADER_SCORE and len(best_matches) >= MIN_HEADER_MATCHES:
+        return best_idx
+    return None
+
+
+def _promote_detected_header(raw_df: pd.DataFrame) -> pd.DataFrame:
+    """Promote the detected census header row and discard rows above it.
+
+    The returned DataFrame keeps `source_row_offset` in attrs so validation
+    messages can still point back to the original spreadsheet/CSV row numbers.
+    """
+    raw_df = raw_df.fillna("").astype(str)
+    header_idx = _detect_header_row_index(raw_df)
+    if header_idx is None:
+        header_idx = 0
+        detection_note = "No high-confidence header row was detected; treated row 1 as the header."
+    elif header_idx > 0:
+        detection_note = f"Detected census header row at source row {header_idx + 1}; ignored {header_idx} row(s) above the header."
+    else:
+        detection_note = "Detected census header row at source row 1."
+
+    subset = raw_df.iloc[header_idx:].copy()
+    nonblank_cols = []
+    for ci in range(subset.shape[1]):
+        if subset.iloc[:, ci].map(lambda x: str(x).strip() != "").any():
+            nonblank_cols.append(ci)
+    if nonblank_cols:
+        subset = subset.iloc[:, : max(nonblank_cols) + 1]
+
+    headers = _make_unique_columns(subset.iloc[0].tolist()) if len(subset) else []
+    data = subset.iloc[1:].copy() if len(subset) > 1 else pd.DataFrame(columns=range(len(headers)))
+    data.columns = headers
+
+    # Drop columns with generated blank headers when they contain no data. This
+    # removes thousands of trailing empty columns from some employer templates.
+    keep_cols: list[str] = []
+    for col in data.columns:
+        is_generated_blank = str(col).startswith("Unnamed Column ")
+        has_data = data[col].map(lambda x: str(x).strip() != "").any() if len(data) else False
+        if has_data or not is_generated_blank:
+            keep_cols.append(col)
+    data = data.loc[:, keep_cols]
+
+    data = data.fillna("").astype(str).reset_index(drop=True)
+    data.columns = [str(c).strip() for c in data.columns]
+    data.attrs["source_row_offset"] = int(header_idx)
+    data.attrs["detected_header_row"] = int(header_idx + 1)
+    data.attrs["header_detection_note"] = detection_note
+    return data
+
+
+def _detect_delimiter(text: str) -> str:
+    lines = [line for line in text.splitlines() if line.strip()]
+    sample_lines = lines[:25] if lines else []
+    delimiter_counts = {
+        ",": max([line.count(",") for line in sample_lines] or [0]),
+        "\t": max([line.count("\t") for line in sample_lines] or [0]),
+        "|": max([line.count("|") for line in sample_lines] or [0]),
+        ";": max([line.count(";") for line in sample_lines] or [0]),
+    }
+    delimiter = max(delimiter_counts, key=delimiter_counts.get)
+    return delimiter if delimiter_counts[delimiter] > 0 else ","
+
+
+def _read_delimited_grid(text: str, delimiter: str) -> pd.DataFrame:
+    reader = csv.reader(io.StringIO(text), delimiter=delimiter)
+    rows = [row for row in reader]
+    if not rows:
+        return pd.DataFrame()
+    width = max(len(row) for row in rows)
+    padded = [row + [""] * (width - len(row)) for row in rows]
+    return pd.DataFrame(padded, dtype=str)
+
+
+def _read_csv_text(text: str) -> pd.DataFrame:
+    """Read comma, tab, pipe, or semicolon delimited census text safely.
+
+    Supports employer templates that include title/instruction/summary rows
+    above the true census header row.
+    """
+    delimiter = _detect_delimiter(text)
+    try:
+        raw_df = _read_delimited_grid(text, delimiter)
+    except Exception:
+        # Fallback to pandas' parser if csv.reader cannot handle an unusual file.
+        raw_df = pd.read_csv(io.StringIO(text), dtype=str, keep_default_na=False, sep=None, engine="python", header=None)
+    return _promote_detected_header(raw_df)
+
+
+def _read_csv_with_fallback_encoding(file_obj) -> tuple[pd.DataFrame, str]:
+    """Try a sequence of encodings until one parses cleanly.
+
+    Accepts a file-like object (e.g. an uploaded file or BytesIO) and returns
+    the parsed DataFrame along with the encoding that worked.
+    """
+    raw_bytes = file_obj.read()
+    if isinstance(raw_bytes, str):
+        df = _read_csv_text(raw_bytes)
+        return df, "text"
+
+    last_exc: Optional[Exception] = None
+    for enc in CANDIDATE_ENCODINGS:
+        try:
+            text = raw_bytes.decode(enc)
+            df = _read_csv_text(text)
+            return df, enc
+        except (UnicodeDecodeError, UnicodeError) as exc:
+            last_exc = exc
+            continue
+        except Exception as exc:
+            last_exc = exc
+            continue
+
+    try:
+        text = raw_bytes.decode("latin-1", errors="replace")
+        df = _read_csv_text(text)
+        return df, "latin-1 (with replacement)"
+    except Exception:
+        raise last_exc if last_exc else RuntimeError("Unable to decode file")
+
+
+def read_uploaded_file(uploaded) -> pd.DataFrame:
+    name = uploaded.name.lower()
+    if name.endswith(".csv"):
+        df, _enc_used = _read_csv_with_fallback_encoding(uploaded)
+    elif name.endswith((".xlsx", ".xls")):
+        raw_df = pd.read_excel(uploaded, dtype=str, keep_default_na=False, header=None)
+        df = _promote_detected_header(raw_df)
+    else:
+        raise ValueError(f"Unsupported file type: {uploaded.name}")
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+# =============================================================================
+# 6. COLUMN MAPPING FOR STANDARD VERTICAL FILES
+# =============================================================================
+
+FUZZY_THRESHOLD = 82
+
+
+def map_columns(df: pd.DataFrame) -> tuple[dict[int, int], list[str], list[str]]:
+    raw_headers = [str(c) for c in df.columns]
+    headers_norm = [_norm(h) for h in raw_headers]
+    mapping: dict[int, int] = {}
+    used_df_cols: set[int] = set()
+    mapping_notes: list[str] = []
+
+    for fi, field_def in enumerate(FIELDS):
+        for ci, hn in enumerate(headers_norm):
+            if ci in used_df_cols:
+                continue
+            canonical = HEADER_ALIASES.get(hn)
+            if canonical == field_def["name"]:
+                mapping[fi] = ci
+                used_df_cols.add(ci)
+                break
+
+    # Conservative fallback for long instructional headers and templates with
+    # line breaks, e.g. "Relationship Employee (EE), Spouse (SP), or Child (CH)".
+    for fi, field_def in enumerate(FIELDS):
+        if fi in mapping:
+            continue
+        for ci, raw_header in enumerate(raw_headers):
+            if ci in used_df_cols:
+                continue
+            canonical = _infer_canonical_header_name(raw_header)
+            if canonical == field_def["name"]:
+                mapping[fi] = ci
+                used_df_cols.add(ci)
+                mapping_notes.append(f"Mapped '{raw_headers[ci]}' -> '{field_def['name']}'")
+                break
+
+    if FUZZY_AVAILABLE:
+        for fi, field_def in enumerate(FIELDS):
+            if fi in mapping:
+                continue
+            candidates = [(ci, headers_norm[ci]) for ci in range(len(raw_headers)) if ci not in used_df_cols]
+            if not candidates:
+                break
+            best_ci, best_score = None, 0
+            for ci, hn in candidates:
+                score = max(
+                    fuzz.ratio(field_def["name"].lower(), hn),
+                    fuzz.token_sort_ratio(field_def["name"].lower(), hn),
+                )
+                if score > best_score:
+                    best_score, best_ci = score, ci
+            if best_ci is not None and best_score >= FUZZY_THRESHOLD:
+                mapping[fi] = best_ci
+                used_df_cols.add(best_ci)
+                mapping_notes.append(f"Fuzzy mapped '{raw_headers[best_ci]}' → '{field_def['name']}' (score {best_score})")
+
+    unrecognised = [raw_headers[ci] for ci in range(len(raw_headers)) if ci not in used_df_cols]
+    return mapping, unrecognised, mapping_notes
+
+# =============================================================================
+# 7. HORIZONTAL CENSUS DETECTION + NORMALISATION
+# =============================================================================
+
+@dataclass
+class HorizontalOptions:
+    auto_placeholder_names: bool = True
+    infer_dependents_enrolled_when_tier_missing: bool = True
+    inherit_worksite_zip_to_dependents: bool = True
+    exclude_interns_and_contractors: bool = True
+
+@dataclass
+class HorizontalColumnMap:
+    employee_first: Optional[str] = None
+    employee_last: Optional[str] = None
+    employee_id: Optional[str] = None
+    employee_dob: Optional[str] = None
+    employee_gender: Optional[str] = None
+    employee_email: Optional[str] = None
+    address1: Optional[str] = None
+    address2: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    zip_code: Optional[str] = None
+    county: Optional[str] = None
+    worksite_zip: Optional[str] = None
+    worksite_county: Optional[str] = None
+    ichra_class: Optional[str] = None
+    worker_category: Optional[str] = None
+    position_status: Optional[str] = None
+    health_election: Optional[str] = None
+    health_waive_reason: Optional[str] = None
+    plan_vendor: Optional[str] = None
+    plan_name: Optional[str] = None
+    plan_tier: Optional[str] = None
+    oop_single: Optional[str] = None
+    oop_family: Optional[str] = None
+    ded_single: Optional[str] = None
+    ded_family: Optional[str] = None
+    er_cost: Optional[str] = None
+    ee_cost: Optional[str] = None
+    annual_salary: Optional[str] = None
+    hourly_rate: Optional[str] = None
+    hours_per_week: Optional[str] = None
+    notes: Optional[str] = None
+
+@dataclass
+class DepSlot:
+    slot: str
+    number: int = 9999
+    relationship_col: Optional[str] = None
+    dob_col: Optional[str] = None
+    first_col: Optional[str] = None
+    last_col: Optional[str] = None
+    default_relationship: str = ""
+
+
+def _is_ancillary_header(header: str) -> bool:
+    h = _norm(header)
+    # Do not treat HSA in a medical plan name as ancillary. Exclude only clear ancillary product headers.
+    return any(term in h.split() or term in h for term in ANCILLARY_TERMS)
+
+
+def _looks_health_header(header: str) -> bool:
+    h = _norm(header)
+    if _is_ancillary_header(h):
+        return False
+    return any(term in h for term in HEALTH_TERMS) or "medical" in h or "med " in f"{h} "
+
+
+def _pick_col(
+    df: pd.DataFrame,
+    aliases: list[str],
+    *,
+    health_only: bool = False,
+    allow_contains: bool = True,
+    allow_fuzzy: bool = True,
+) -> Optional[str]:
+    headers = list(df.columns)
+    norm_to_header: dict[str, str] = {_norm(h): h for h in headers}
+    for a in aliases:
+        n = _norm(a)
+        if n in norm_to_header:
+            h = norm_to_header[n]
+            if not health_only or _looks_health_header(h):
+                return h
+    # Contains pass, useful for employer exports with long labels.
+    # Can be disabled for fields where broad aliases like "Employee #" normalize
+    # to "employee" and would otherwise match unrelated columns such as
+    # "Employee Cost".
+    alias_norm = [_norm(a) for a in aliases]
+    if allow_contains:
+        for h in headers:
+            hn = _norm(h)
+            if health_only and not _looks_health_header(h):
+                continue
+            if any(a and len(a) >= 4 and (hn == a or a in hn or hn in a) for a in alias_norm):
+                return h
+    if allow_fuzzy and FUZZY_AVAILABLE:
+        for a in alias_norm:
+            match = rf_process.extractOne(a, [_norm(h) for h in headers], scorer=fuzz.token_sort_ratio)
+            if match:
+                best_norm, score, _ = match
+                if score >= 95:
+                    h = norm_to_header.get(best_norm)
+                    if h and (not health_only or _looks_health_header(h)):
+                        return h
+    return None
+
+
+def build_horizontal_column_map(df: pd.DataFrame) -> HorizontalColumnMap:
+    cm = HorizontalColumnMap()
+    cm.employee_first = _pick_col(df, ["First Name", "Employee First Name", "EE First Name", "First", "Given Name"])
+    cm.employee_last = _pick_col(df, ["Last Name", "Employee Last Name", "EE Last Name", "Last", "Surname", "Family Name"])
+    cm.employee_id = _pick_col(df, ["Employee ID", "Employee Number", "Employee #", "Worker ID", "Person Number"], allow_contains=False, allow_fuzzy=False)
+    cm.employee_dob = _pick_col(df, ["BIRTH DATE", "DOB", "Employee DOB", "Employee Date of Birth", "Date of Birth", "Birthdate"])
+    cm.employee_gender = _pick_col(df, ["Gender", "Sex"])
+    cm.employee_email = _pick_col(df, ["Email", "Email Address", "Work Email", "Personal Email"])
+    cm.address1 = _pick_col(df, ["PRIMARY ADDRESS LINE 1", "Address Line 1", "Street Address", "Home Address Line 1"])
+    cm.address2 = _pick_col(df, ["PRIMARY ADDRESS LINE 2", "Address Line 2", "Home Address Line 2"])
+    cm.city = _pick_col(df, ["PRIMARY ADDRESS - CITY", "Primary Address City", "City", "Home City"])
+    cm.state = _pick_col(df, ["PRIMARY ADDRESS - STATE / TERRITORY", "Primary Address State", "State", "Home State"])
+    cm.zip_code = _pick_col(df, ["PRIMARY ADDRESS - ZIP CODE", "Primary Address Zip Code", "Zip Code", "Zip", "Home Zip"])
+    cm.county = _pick_col(df, ["County", "Home County", "Primary Address County"])
+    cm.worksite_zip = _pick_col(df, ["WORKSITE ZIP CODE", "Primary Worksite Zip Code", "Worksite Zip", "Work Zip", "Work Location Zip"])
+    cm.worksite_county = _pick_col(df, ["Primary Worksite County", "Worksite County", "Work County", "Work Location County"])
+    cm.ichra_class = _pick_col(df, ["ICHRA Class", "Benefit Class", "Employee Class", "Class"])
+    cm.worker_category = _pick_col(df, ["WORKER CATEGORY", "Worker Category", "Employee Type", "Employment Type"])
+    cm.position_status = _pick_col(df, ["POSITION STATUS", "Employment Status", "Status"])
+    cm.health_election = _pick_col(df, ["Health Election", "Medical Election", "Medical Coverage Election", "Coverage Election"], health_only=True)
+    cm.health_waive_reason = _pick_col(df, ["MEDICAL WAIVE REASON", "Health Waive Reason", "Waive Reason"], health_only=True)
+    cm.plan_vendor = _pick_col(df, ["Current Health Plan Vendor", "Health Carrier", "Medical Carrier", "Carrier", "Medical Vendor"], health_only=True)
+    cm.plan_name = (
+        _pick_col(df, ["Product Name", "Current Plan Name", "Current Product Name", "Medical Product Name", "Health Product Name"], allow_fuzzy=False)
+        or _pick_col(df, ["MEDICAL PLAN NAME", "Medical Plan Name", "Health Plan Name", "Current Health Plan", "Plan Name"], health_only=True)
+    )
+    cm.plan_tier = _pick_col(df, ["Current Health Plan Tier", "Medical Plan Tier", "Medical Coverage Tier", "Coverage Tier", "Coverage Level", "Benefit Tier", "Election Tier"], health_only=True)
+    cm.oop_single = _pick_col(df, ["Current Health Plan OOP (single)", "Medical OOP Single", "OOP Single"], health_only=True)
+    cm.oop_family = _pick_col(df, ["Current Health Plan OOP (family)", "Medical OOP Family", "OOP Family"], health_only=True)
+    cm.ded_single = _pick_col(df, ["Current Health Plan Deductible (single)", "Medical Deductible Single", "Deductible Single"], health_only=True)
+    cm.ded_family = _pick_col(df, ["Current Health Plan Deductible (family)", "Medical Deductible Family", "Deductible Family"], health_only=True)
+    cm.er_cost = _pick_col(df, ["Current Health Plan ER Cost", "Medical ER Cost", "Employer Cost", "Pending Employer Cost", "Employer Contribution"], allow_fuzzy=False)
+    cm.ee_cost = _pick_col(df, ["Current Health Plan EE Cost", "Medical EE Cost", "Employee Cost", "Pending Employee Cost", "Employee Contribution"], allow_fuzzy=False)
+    cm.annual_salary = _pick_col(df, ["ANNUAL SALARY", "Annual Salary", "Salary", "Base Salary"])
+    cm.hourly_rate = _pick_col(df, ["Hourly Rate", "Hourly Wage"])
+    cm.hours_per_week = _pick_col(df, ["Hours Per Week", "Weekly Hours"])
+    cm.notes = _pick_col(df, ["Notes", "Comments", "Remarks"])
+    return cm
+
+
+def find_dependent_slots(df: pd.DataFrame) -> tuple[list[DepSlot], bool]:
+    """Return dependent slots and whether this is row-wise dependent data."""
+    headers = list(df.columns)
+    norm_headers = {_norm(h): h for h in headers}
+
+    # Row-wise export: one Dependent Relationship and one Dependent DOB column, repeated employee rows.
+    row_rel = _pick_col(df, ["Dependent Relationship", "Dependent Relation", "Dependent Type", "Dep Relationship", "Dep Type"])
+    row_dob = _pick_col(df, ["Dependent DOB", "Dependent Date of Birth", "Dependent Birth Date", "Dep DOB", "Dep Birth Date"])
+    row_num = _pick_col(df, ["Dependent Number", "Dependent #", "Dep Number", "Dep #"])
+    row_first = _pick_col(df, ["Dependent First Name", "Dep First Name", "Dependent First"])
+    row_last = _pick_col(df, ["Dependent Last Name", "Dep Last Name", "Dependent Last"])
+    if row_rel or row_dob:
+        return [DepSlot("rowwise", relationship_col=row_rel, dob_col=row_dob, first_col=row_first, last_col=row_last, number=1)], True
+
+    slots: dict[str, DepSlot] = {}
+
+    def get_slot(key: str, number: int, default_relationship: str = "") -> DepSlot:
+        if key not in slots:
+            slots[key] = DepSlot(slot=key, number=number, default_relationship=default_relationship)
+        elif default_relationship and not slots[key].default_relationship:
+            slots[key].default_relationship = default_relationship
+        return slots[key]
+
+    for h in headers:
+        hn = _norm(h)
+        hc = _compact(h)
+        if _is_ancillary_header(hn):
+            continue
+
+        # Spouse DOB / Spouse First / Spouse Last
+        if "spouse" in hn or "domestic partner" in hn:
+            m = re.search(r"(\d+)", hn)
+            number = int(m.group(1)) if m else 1
+            slot = get_slot(f"spouse_{number}", 100 + number, "Spouse")
+            if any(x in hn for x in ["dob", "date of birth", "birth date", "birthdate"]):
+                slot.dob_col = h
+            elif "first" in hn and "name" in hn:
+                slot.first_col = h
+            elif "last" in hn and "name" in hn:
+                slot.last_col = h
+            elif "relationship" in hn or "relation" in hn or "type" in hn:
+                slot.relationship_col = h
+            continue
+
+        # Child 1 DOB / Child 2 First / Child 3 Last
+        if "child" in hn or "dependent" in hn or re.search(r"\bdep\b", hn):
+            m = re.search(r"(\d+)", hn)
+            number = int(m.group(1)) if m else 999
+            default_rel = "Child" if "child" in hn else ""
+            slot_key = f"dep_{number}"
+            slot = get_slot(slot_key, 200 + number, default_rel)
+            if any(x in hn for x in ["dob", "date of birth", "birth date", "birthdate"]):
+                slot.dob_col = h
+            elif "first" in hn and "name" in hn:
+                slot.first_col = h
+            elif "last" in hn and "name" in hn:
+                slot.last_col = h
+            elif "relationship" in hn or "relation" in hn or "type" in hn:
+                slot.relationship_col = h
+            continue
+
+    complete_or_partial = [s for s in slots.values() if s.dob_col or s.relationship_col or s.first_col or s.last_col]
+    complete_or_partial.sort(key=lambda s: (0 if s.default_relationship == "Spouse" else 1, s.number, s.slot))
+    return complete_or_partial, False
+
+
+def detect_horizontal_census(df: pd.DataFrame) -> tuple[bool, str]:
+    headers_norm = [_norm(c) for c in df.columns]
+    has_canonical_relationship = any(h == "relationship" for h in headers_norm)
+    has_canonical_dob = any(h in {"dob", "date of birth", "birth date"} for h in headers_norm)
+    has_dep = any("dependent" in h or re.search(r"\bdep\b", h) or "spouse" in h or "child" in h for h in headers_norm)
+    has_dep_health = any(("dependent" in h or "spouse" in h or "child" in h) and ("dob" in h or "birth" in h or "relationship" in h) for h in headers_norm)
+
+    if has_dep_health:
+        return True, "Dependent columns detected"
+    if has_dep and not (has_canonical_relationship and has_canonical_dob):
+        return True, "Horizontal dependent-style headers detected"
+    return False, "Standard vertical format detected"
+
+
+def _cell(row: pd.Series, col: Optional[str]) -> str:
+    if not col or col not in row.index:
+        return ""
+    return str(row[col] or "").strip()
+
+
+def _first_nonblank(rows: pd.DataFrame, col: Optional[str]) -> str:
+    if not col or col not in rows.columns:
+        return ""
+    for v in rows[col].tolist():
+        if str(v).strip():
+            return str(v).strip()
+    return ""
+
+
+def _derive_ichra_class(row: pd.Series, cm: HorizontalColumnMap) -> str:
+    direct = _cell(row, cm.ichra_class)
+    if direct:
+        return direct
+    worker_category = _cell(row, cm.worker_category)
+    state = _cell(row, cm.state).upper()
+    if not worker_category:
+        return "NY Full Time Benefits Eligible" if state in {"NY", "VT"} else "Full Time Benefits Eligible"
+    wc = _norm(worker_category)
+    if "intern" in wc or "contractor" in wc:
+        return ""
+    if "part" in wc:
+        return "NY Part Time Benefits Eligible" if state in {"NY", "VT"} else "Part Time Benefits Eligible"
+    return "NY Full Time Benefits Eligible" if state in {"NY", "VT"} else "Full Time Benefits Eligible"
+
+
+def _should_exclude_employee(row: pd.Series, cm: HorizontalColumnMap, options: HorizontalOptions) -> bool:
+    if not options.exclude_interns_and_contractors:
+        return False
+    wc = _norm(_cell(row, cm.worker_category))
+    return "intern" in wc or "contractor" in wc
+
+
+def _employee_group_key(row: pd.Series, cm: HorizontalColumnMap, row_index: int) -> tuple[Any, ...]:
+    emp_id = _cell(row, cm.employee_id)
+    if emp_id:
+        return ("employee_id", emp_id)
+    first = _cell(row, cm.employee_first)
+    last = _cell(row, cm.employee_last)
+    dob = _cell(row, cm.employee_dob)
+    if first or last:
+        return ("name_dob", first, last, dob, _cell(row, cm.zip_code))
+    # For anonymous horizontal files, repeat rows are grouped by stable employee-level fields.
+    stable_values = [
+        _cell(row, cm.employee_dob), _cell(row, cm.address1), _cell(row, cm.city), _cell(row, cm.state),
+        _cell(row, cm.zip_code), _cell(row, cm.worksite_zip), _cell(row, cm.worker_category),
+        _cell(row, cm.position_status), _cell(row, cm.annual_salary), _cell(row, cm.plan_name),
+        _cell(row, cm.plan_tier), _cell(row, cm.health_waive_reason),
+    ]
+    if any(stable_values):
+        return ("anonymous", *stable_values)
+    return ("row", row_index)
+
+
+def _sort_dependents(deps: list[dict[str, str]]) -> list[dict[str, str]]:
+    def key(d: dict[str, str]) -> tuple[int, int]:
+        rel = d.get("Relationship", "")
+        rel_order = 0 if rel == "Spouse" else 1 if rel == "Child" else 2
+        raw_num = str(d.get("_dep_number", "9999"))
+        m = re.search(r"\d+", raw_num)
+        num = int(m.group(0)) if m else 9999
+        return rel_order, num
+    return sorted(deps, key=key)
+
+
+def _infer_tier_from_dependents(deps: list[dict[str, str]]) -> str:
+    has_spouse = any(d.get("Relationship") == "Spouse" for d in deps)
+    has_child = any(d.get("Relationship") == "Child" for d in deps)
+    if has_spouse and has_child:
+        return "Family"
+    if has_spouse:
+        return "Employee + Spouse"
+    if has_child:
+        return "Employee + Children"
+    return "Employee Only"
+
+
+def convert_horizontal_to_vertical(df: pd.DataFrame, options: HorizontalOptions) -> dict[str, Any]:
+    source_row_offset = int(df.attrs.get("source_row_offset", 0) or 0)
+    df = df.fillna("").astype(str).reset_index(drop=True)
+    cm = build_horizontal_column_map(df)
+    dep_slots, rowwise = find_dependent_slots(df)
+    notes: list[dict[str, str]] = []
+    output_rows: list[dict[str, str]] = []
+    placeholder_counter = 1
+
+    if not dep_slots:
+        notes.append({"Kind": "Warning", "Issue": "Horizontal mode was selected, but no dependent DOB/relationship columns were detected."})
+
+    groups: list[tuple[tuple[Any, ...], list[int]]] = []
+    seen: dict[tuple[Any, ...], int] = {}
+    for idx, row in df.iterrows():
+        if all(str(v).strip() == "" for v in row):
+            continue
+        if _should_exclude_employee(row, cm, options):
+            notes.append({"Kind": "Warning", "Issue": f"Input row {idx + 2 + source_row_offset} skipped because Worker Category appears to be intern/contractor."})
+            continue
+        key = _employee_group_key(row, cm, int(idx)) if rowwise else ("single_row", int(idx))
+        if key not in seen:
+            seen[key] = len(groups)
+            groups.append((key, []))
+        groups[seen[key]][1].append(int(idx))
+
+    def base_row() -> dict[str, str]:
+        return {c: "" for c in OUTPUT_COLUMNS}
+
+    def apply_placeholder(row_out: dict[str, str], relationship: str) -> None:
+        nonlocal placeholder_counter
+        if row_out["First Name"] or row_out["Last Name"]:
+            return
+        if options.auto_placeholder_names:
+            row_out["First Name"] = relationship or "Member"
+            row_out["Last Name"] = str(placeholder_counter)
+            placeholder_counter += 1
+
+    for _, idxs in groups:
+        rows = df.loc[idxs]
+        first_row = rows.iloc[0]
+
+        dep_records: list[dict[str, str]] = []
+        if rowwise:
+            slot = dep_slots[0]
+            for idx in idxs:
+                src = df.loc[idx]
+                rel_raw = _cell(src, slot.relationship_col)
+                dob = _cell(src, slot.dob_col)
+                first = _cell(src, slot.first_col)
+                last = _cell(src, slot.last_col)
+                dep_num = _cell(src, _pick_col(df, ["Dependent Number", "Dependent #", "Dep Number", "Dep #"])) or str(len(dep_records) + 1)
+                if not any([rel_raw, dob, first, last]):
+                    continue
+
+                rel_parts = [x.strip() for x in re.split(r"\s*[|;/]\s*", rel_raw) if x.strip()] or [rel_raw]
+                dob_parts = [x.strip() for x in re.split(r"\s*[|;]\s*", dob) if x.strip()] or [dob]
+                first_parts = [x.strip() for x in re.split(r"\s*[|;]\s*", first) if x.strip()] or [first]
+                last_parts = [x.strip() for x in re.split(r"\s*[|;]\s*", last) if x.strip()] or [last]
+                part_count = max(len(rel_parts), len(dob_parts), len(first_parts), len(last_parts), 1)
+                if part_count > 1:
+                    notes.append({"Kind": "Auto-fix", "Issue": f"Input row {idx + 2 + source_row_offset}: split one dependent cell into {part_count} dependent rows."})
+
+                for part_i in range(part_count):
+                    rel_piece = rel_parts[part_i] if part_i < len(rel_parts) else (rel_parts[-1] if rel_parts else "")
+                    dob_piece = dob_parts[part_i] if part_i < len(dob_parts) else ""
+                    first_piece = first_parts[part_i] if part_i < len(first_parts) else ""
+                    last_piece = last_parts[part_i] if part_i < len(last_parts) else ""
+                    rel, note = normalize_relationship(rel_piece)
+                    if note:
+                        notes.append({"Kind": "Auto-fix", "Issue": f"Input row {idx + 2 + source_row_offset}: {note}"})
+                    if rel == "Employee":
+                        # Row-wise horizontal files often include a self/member row in the
+                        # dependent columns. The converter already creates the employee row,
+                        # so keeping this record would duplicate the employee and break the
+                        # intended Employee, Spouse, Child ordering.
+                        continue
+                    dep_records.append({"Relationship": rel, "DOB": dob_piece, "First Name": first_piece, "Last Name": last_piece, "_dep_number": f"{dep_num}.{part_i + 1}" if part_count > 1 else dep_num, "_source_row": str(idx + 2 + source_row_offset)})
+        else:
+            for slot in dep_slots:
+                explicit_rel_raw = _cell(first_row, slot.relationship_col)
+                dob = _cell(first_row, slot.dob_col)
+                first = _cell(first_row, slot.first_col)
+                last = _cell(first_row, slot.last_col)
+                if not any([explicit_rel_raw, dob, first, last]):
+                    continue
+                rel_raw = explicit_rel_raw or slot.default_relationship
+                rel, note = normalize_relationship(rel_raw)
+                if note:
+                    notes.append({"Kind": "Auto-fix", "Issue": f"Input row {idxs[0] + 2 + source_row_offset}: {note}"})
+                dep_records.append({"Relationship": rel, "DOB": dob, "First Name": first, "Last Name": last, "_dep_number": str(slot.number), "_source_row": str(idxs[0] + 2 + source_row_offset)})
+
+        dep_records = _sort_dependents(dep_records)
+
+        # Employee-level tier/election decision.
+        raw_election = _first_nonblank(rows, cm.health_election)
+        raw_waive_reason = _first_nonblank(rows, cm.health_waive_reason)
+        raw_plan_name = _first_nonblank(rows, cm.plan_name)
+        raw_tier = _first_nonblank(rows, cm.plan_tier)
+        tier, tier_note = normalize_tier(raw_tier)
+        if tier_note:
+            notes.append({"Kind": "Auto-fix", "Issue": tier_note})
+
+        employee_election, election_note = normalize_election(raw_election)
+        if election_note:
+            notes.append({"Kind": "Auto-fix", "Issue": election_note})
+        if not employee_election:
+            if tier == "Waive" or raw_waive_reason:
+                employee_election = "Waive"
+            elif raw_plan_name or (tier and tier != "Waive"):
+                employee_election = "Enroll"
+            else:
+                employee_election = "Waive"
+                notes.append({"Kind": "Warning", "Issue": f"Input row {idxs[0] + 2 + source_row_offset}: no health election, product name, or coverage tier found; defaulted employee to Waive."})
+
+        if not tier:
+            if employee_election == "Waive":
+                tier = "Waive"
+            elif raw_plan_name and options.infer_dependents_enrolled_when_tier_missing:
+                tier = _infer_tier_from_dependents(dep_records)
+                notes.append({"Kind": "Warning", "Issue": f"Input row {idxs[0] + 2 + source_row_offset}: medical plan exists but no health tier was found; inferred '{tier}' from listed dependents."})
+            elif raw_plan_name:
+                tier = "Employee Only"
+                notes.append({"Kind": "Warning", "Issue": f"Input row {idxs[0] + 2 + source_row_offset}: medical plan exists but no health tier was found; treated as Employee Only."})
+            else:
+                tier = "Waive"
+
+        employee = base_row()
+        employee["First Name"] = _first_nonblank(rows, cm.employee_first)
+        employee["Last Name"] = _first_nonblank(rows, cm.employee_last)
+        apply_placeholder(employee, "Employee")
+        employee["Employee ID"] = _first_nonblank(rows, cm.employee_id)
+        employee["Relationship"] = "Employee"
+        employee["DOB"] = _first_nonblank(rows, cm.employee_dob)
+        employee["Gender"] = _first_nonblank(rows, cm.employee_gender)
+        employee["Email"] = _first_nonblank(rows, cm.employee_email)
+        employee["Address Line 1"] = _first_nonblank(rows, cm.address1)
+        employee["Address Line 2"] = _first_nonblank(rows, cm.address2)
+        employee["City"] = _first_nonblank(rows, cm.city)
+        employee["State"] = _first_nonblank(rows, cm.state)
+        employee["Zip Code"] = _first_nonblank(rows, cm.zip_code)
+        employee["County"] = _first_nonblank(rows, cm.county)
+        employee["Primary Worksite Zip Code"] = _first_nonblank(rows, cm.worksite_zip)
+        employee["Primary Worksite County"] = _first_nonblank(rows, cm.worksite_county)
+        employee["ICHRA Class"] = _derive_ichra_class(first_row, cm)
+        employee["Health Election"] = employee_election
+        employee["Current Health Plan Vendor"] = _first_nonblank(rows, cm.plan_vendor)
+        employee["Current Health Plan"] = raw_plan_name
+        employee["Current Health Plan Tier"] = tier if tier != "Waive" else ""
+        employee["Current Health Plan OOP (single)"] = _first_nonblank(rows, cm.oop_single)
+        employee["Current Health Plan OOP (family)"] = _first_nonblank(rows, cm.oop_family)
+        employee["Current Health Plan Deductible (single)"] = _first_nonblank(rows, cm.ded_single)
+        employee["Current Health Plan Deductible (family)"] = _first_nonblank(rows, cm.ded_family)
+        employee["Current Health Plan ER Cost"] = _first_nonblank(rows, cm.er_cost)
+        employee["Current Health Plan EE Cost"] = _first_nonblank(rows, cm.ee_cost)
+        employee["Annual Salary"] = _first_nonblank(rows, cm.annual_salary)
+        employee["Hourly Rate"] = _first_nonblank(rows, cm.hourly_rate)
+        employee["Hours Per Week"] = _first_nonblank(rows, cm.hours_per_week)
+        employee["Notes"] = _first_nonblank(rows, cm.notes)
+        output_rows.append(employee)
+
+        for dep in dep_records:
+            dep_row = base_row()
+            dep_row["First Name"] = dep.get("First Name", "")
+            dep_row["Last Name"] = dep.get("Last Name", "")
+            dep_row["Relationship"] = dep.get("Relationship", "")
+            apply_placeholder(dep_row, dep_row["Relationship"] or "Dependent")
+            dep_row["DOB"] = dep.get("DOB", "")
+            dep_row["Zip Code"] = employee["Zip Code"]
+            dep_row["County"] = employee["County"]
+            if options.inherit_worksite_zip_to_dependents:
+                dep_row["Primary Worksite Zip Code"] = employee["Primary Worksite Zip Code"]
+                dep_row["Primary Worksite County"] = employee["Primary Worksite County"]
+            dep_row["ICHRA Class"] = employee["ICHRA Class"]
+            dep_row["Health Election"] = dependent_election_from_tier(employee_election, tier, dep_row["Relationship"])
+            output_rows.append(dep_row)
+
+            if not dep_row["Relationship"]:
+                notes.append({"Kind": "Warning", "Issue": f"Input row {dep.get('_source_row', '?')}: dependent has no relationship."})
+            if not dep_row["DOB"]:
+                notes.append({"Kind": "Warning", "Issue": f"Input row {dep.get('_source_row', '?')}: dependent has no DOB."})
+
+    converted = pd.DataFrame(output_rows, columns=OUTPUT_COLUMNS)
     return {
-        "relationship": relationship,
-        "dob": dep_dob,
-        "first": row_value(row, dep_first_col),
-        "last": row_value(row, dep_last_col),
+        "converted_df": converted,
+        "horizontal_notes": notes,
+        "source_rows": len(df),
+        "output_rows": len(converted),
+        "employee_groups": len(groups),
+        "rowwise_horizontal": rowwise,
     }
 
-
-def extract_wide_dependents(row: pd.Series, df: pd.DataFrame) -> list[dict[str, str]]:
-    deps: list[dict[str, str]] = []
-    dep_cols = find_dependent_columns(df)
-    for item in dep_cols["spouse"] + dep_cols["child"]:
-        dob = row_value(row, item.get("dob"))
-        if not dob:
-            continue
-        for dob_part in split_multi(dob) or [dob]:
-            deps.append({
-                "relationship": item["relationship"],
-                "dob": dob_part,
-                "first": row_value(row, item.get("first")),
-                "last": row_value(row, item.get("last")),
-            })
-    return deps
-
-
-def convert_horizontal_to_vertical(df: pd.DataFrame, mapping: dict[str, str], options: EngineOptions) -> tuple[pd.DataFrame, list[Issue]]:
-    out_rows: list[dict[str, str]] = []
-    notes: list[Issue] = []
-    groups: dict[str, dict[str, Any]] = {}
-
-    for idx, row in df.iterrows():
-        display_row = int(idx) + 2
-        if should_skip_horizontal_row(row, options):
-            notes.append(Issue(display_row, "-", "Horizontal Conversion", "", "Warning", "Skipped row because it appears ineligible, inactive, terminated, intern, or contractor."))
-            continue
-
-        key = employee_group_key(row, mapping, display_row)
-        if key not in groups:
-            groups[key] = {"first_row": row, "row_numbers": [], "dependents": []}
-        groups[key]["row_numbers"].append(display_row)
-
-        dep = extract_rowwise_dependent(row, mapping, options)
-        if dep:
-            groups[key]["dependents"].append(dep)
-        for wide_dep in extract_wide_dependents(row, df):
-            groups[key]["dependents"].append(wide_dep)
-
-    for seq, (key, group) in enumerate(groups.items(), start=1):
-        base_row = group["first_row"]
-        employee = build_employee_row(base_row, mapping, seq, options)
-        employee_election = employee["Health Election"]
-        tier = employee.get("Current Health Plan Tier", "")
-        out_rows.append(employee)
-
-        seen_deps: set[tuple[str, str, str, str]] = set()
-        cleaned_deps: list[dict[str, str]] = []
-        for dep in group["dependents"]:
-            dep_key = (dep.get("relationship", ""), norm_key(dep.get("dob", "")), norm_key(dep.get("first", "")), norm_key(dep.get("last", "")))
-            if dep_key in seen_deps or not dep.get("dob"):
-                continue
-            seen_deps.add(dep_key)
-            cleaned_deps.append(dep)
-
-        cleaned_deps.sort(key=lambda d: (0 if d.get("relationship") == "Spouse" else 1, normalize_date(d.get("dob", ""))[0], d.get("first", "")))
-        for dep_seq, dep in enumerate(cleaned_deps, start=1):
-            out_rows.append(build_dependent_row(
-                employee,
-                dep.get("relationship", "Child"),
-                dep.get("dob", ""),
-                dep.get("first", ""),
-                dep.get("last", ""),
-                seq,
-                dep_seq,
-                employee_election,
-                tier,
-                options,
-            ))
-
-    notes.append(Issue("-", "-", "Horizontal Conversion", "", "Auto-fix", f"Converted {len(groups)} employee groups into {len(out_rows)} vertical output rows."))
-    return pd.DataFrame(out_rows, columns=OUTPUT_COLUMNS), notes
-
-
 # =============================================================================
-# Core processing
+# 8. CELL-LEVEL VALIDATION
 # =============================================================================
 
+def validate_date(v: str) -> dict[str, Any]:
+    original = str(v or "").strip()
+    if not original:
+        return {"ok": False, "msg": "DOB is required", "fixed_val": "", "fix_note": None}
 
-def validate_and_reformat(df: pd.DataFrame, options: EngineOptions, zip_cache: Optional[dict[str, dict[str, str]]] = None, already_canonical: bool = False) -> ProcessResult:
-    zip_cache = zip_cache or {}
-    errors: list[Issue] = []
-    warnings: list[Issue] = []
-    fixes: list[Issue] = []
-    clears: list[Issue] = []
+    # Excel serial dates, conservative handling.
+    if re.fullmatch(r"\d{5}", original):
+        try:
+            dt = pd.to_datetime(float(original), unit="D", origin="1899-12-30")
+            fixed = dt.strftime("%m/%d/%Y")
+            return {"ok": True, "msg": None, "fixed_val": fixed, "fix_note": f"Excel date serial converted: '{original}' → '{fixed}'"}
+        except Exception:
+            pass
+
+    parsed = pd.to_datetime(original, errors="coerce")
+    if pd.notna(parsed):
+        fixed = parsed.strftime("%m/%d/%Y")
+        year = int(parsed.year)
+        if not (1900 <= year <= 2100):
+            return {"ok": False, "msg": f"Year out of range ({year}) in date '{original}'", "fixed_val": fixed, "fix_note": None}
+        note = f"Date reformatted: '{original}' → '{fixed}'" if fixed != original else None
+        return {"ok": True, "msg": None, "fixed_val": fixed, "fix_note": note}
+
+    return {"ok": False, "msg": f"Invalid date format '{original}' — expected mm/dd/yyyy", "fixed_val": original, "fix_note": None}
+
+
+def validate_cell(field_def: dict[str, Any], raw: str) -> dict[str, Any]:
+    v = str(raw or "").strip()
+    if field_def["required"] and v == "":
+        return {"ok": False, "msg": f"{field_def['name']} is required", "fixed_val": "", "fix_note": None}
+    if v == "":
+        return {"ok": True, "msg": None, "fixed_val": "", "fix_note": None}
+
+    ftype = field_def["type"]
+    if ftype == "date":
+        return validate_date(v)
+    if ftype == "relationship":
+        canonical, note = normalize_relationship(v)
+        if canonical not in {"Employee", "Spouse", "Child"}:
+            return {"ok": False, "msg": f"Invalid Relationship '{v}' — expected Employee, Spouse, or Child", "fixed_val": canonical, "fix_note": note}
+        return {"ok": True, "msg": None, "fixed_val": canonical, "fix_note": note}
+    if ftype == "election":
+        canonical, note = normalize_election(v)
+        if canonical not in {"Enroll", "Waive"}:
+            return {"ok": False, "msg": f"Invalid Health Election '{v}' — expected Enroll or Waive", "fixed_val": v, "fix_note": None}
+        return {"ok": True, "msg": None, "fixed_val": canonical, "fix_note": note}
+    if ftype == "tier":
+        canonical, note = normalize_tier(v)
+        if canonical in {"Employee Only", "Employee + Spouse", "Employee + Children", "Family", ""}:
+            return {"ok": True, "msg": None, "fixed_val": canonical, "fix_note": note}
+        return {"ok": False, "msg": f"Invalid value '{v}' for {field_def['name']} — expected Employee Only, Employee + Spouse, Employee + Children, or Family", "fixed_val": v, "fix_note": None}
+    if ftype == "zipcode":
+        us_states = {
+            "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI", "ID", "IL", "IN", "IA",
+            "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
+            "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT", "VT",
+            "VA", "WA", "WV", "WI", "WY", "DC", "PR", "VI", "GU", "AS", "MP",
+        }
+        if v.upper() in us_states:
+            return {"ok": False, "msg": f"{field_def['name']}: looks like a state abbreviation ('{v}'), not a zip code", "fixed_val": v, "fix_note": None}
+        fixed = _pad_zip(v)
+        note = f"Zip standardised: '{v}' → '{fixed}'" if fixed != v else None
+        if not re.fullmatch(r"\d{5}", fixed):
+            if re.search(r"[A-Za-z]", v):
+                msg = f"{field_def['name']} appears to be a non-U.S. postal code ('{v}'); expected a U.S. 5-digit ZIP code"
+            else:
+                msg = f"{field_def['name']} must be a 5-digit numeric zip, got '{v}'"
+            return {"ok": False, "msg": msg, "fixed_val": fixed, "fix_note": note}
+        if fixed in KNOWN_INVALID_OR_UNSUPPORTED_ZIPS:
+            msg = f"{field_def['name']} '{fixed}' is invalid"
+            return {"ok": False, "msg": msg, "fixed_val": fixed, "fix_note": note}
+        return {"ok": True, "msg": None, "fixed_val": fixed, "fix_note": note}
+    if ftype == "numeric":
+        clean = v.replace(",", "").replace("$", "").strip()
+        if clean.endswith("%"):
+            clean = clean[:-1].strip()
+        if not re.fullmatch(r"-?\d+(\.\d+)?", clean):
+            return {"ok": False, "msg": f"{field_def['name']} must be numeric, got '{v}'", "fixed_val": v, "fix_note": None}
+        note = f"Stripped formatting: '{v}' → '{clean}'" if clean != v else None
+        return {"ok": True, "msg": None, "fixed_val": clean, "fix_note": note}
+    return {"ok": True, "msg": None, "fixed_val": v, "fix_note": None}
+
+# =============================================================================
+# 9. CORE VALIDATION + REFORMAT ENGINE
+# =============================================================================
+
+def run_validation(df: pd.DataFrame, zip_cache: dict[str, dict[str, str]], *, source_label: str = "input") -> dict[str, Any]:
+    source_row_offset = int(df.attrs.get("source_row_offset", 0) or 0)
+    header_detection_note = str(df.attrs.get("header_detection_note", "") or "")
+    df = df.fillna("").astype(str).reset_index(drop=True)
+    errors: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+    fixes: list[dict[str, Any]] = []
+    clears: list[dict[str, Any]] = []
+
+    col_map, unrecognised_cols, mapping_notes = map_columns(df)
+    for uc in unrecognised_cols:
+        warnings.append({"Row": "—", "Col": "—", "Field": uc, "Value": "", "Kind": "Warning", "Issue": f"Unrecognised column '{uc}' — not mapped to any canonical field"})
+
     out_rows: list[dict[str, str]] = []
     valid_positions: list[int] = []
     error_positions: list[int] = []
+    employee_context: dict[str, str] = {}
 
-    mapping, unrecognized, mapping_notes = ({name: name for name in OUTPUT_COLUMNS}, [], []) if already_canonical else map_columns(df, options)
-    if not already_canonical:
-        for col in unrecognized:
-            warnings.append(Issue("-", "-", str(col), "", "Warning", f"Unrecognized column '{col}' was not mapped to a CSA field."))
-
-    for source_idx, row in df.iterrows():
-        if all(cell(v) == "" for v in row.values):
+    for df_ri, row in df.iterrows():
+        if all(str(v).strip() == "" for v in row):
             continue
-        display_row = int(source_idx) + 2
-        output_pos = len(out_rows)
+        display_row = int(df_ri) + 2 + source_row_offset
+        new_row = {col: "" for col in OUTPUT_COLUMNS}
         row_has_error = False
-        new_row = empty_output_row()
+        zip_fields_with_errors: set[str] = set()
+        derived_tier_from_election = ""
 
-        for field_def in FIELDS:
-            raw = row_value(row, mapping.get(field_def.name))
-            if field_def.name in CLEARED_FIELDS:
+        rel_ci = col_map.get(_FIELD_IDX_BY_NAME["Relationship"])
+        rel_raw_preview = str(row.iloc[rel_ci]).strip() if rel_ci is not None else ""
+        rel_preview, _ = normalize_relationship(rel_raw_preview)
+
+        for fi, field_def in enumerate(FIELDS):
+            fname = field_def["name"]
+            ci = col_map.get(fi)
+            raw = str(row.iloc[ci]).strip() if ci is not None else ""
+
+            if rel_preview in {"Spouse", "Child"} and employee_context and not raw:
+                if fname in {"Zip Code", "County", "Primary Worksite Zip Code", "Primary Worksite County", "ICHRA Class"}:
+                    raw = employee_context.get(fname, "")
+                    if raw:
+                        fixes.append({"Row": display_row, "Col": field_def["col"], "Field": fname, "Value": "", "Kind": "Auto-fix", "Issue": f"{fname} inherited from preceding employee row"})
+                elif fname == "Health Election":
+                    raw = dependent_election_from_tier(
+                        employee_context.get("Health Election", ""),
+                        employee_context.get("Current Health Plan Tier", ""),
+                        rel_preview,
+                    )
+                    if raw:
+                        fixes.append({"Row": display_row, "Col": field_def["col"], "Field": fname, "Value": "", "Kind": "Auto-fix", "Issue": f"Health Election derived from preceding employee tier for {rel_preview}"})
+
+            if fname == "Health Election":
+                possible_tier, tier_note = _tier_from_election_code(raw)
+                if possible_tier:
+                    derived_tier_from_election = possible_tier
+                    fixes.append({"Row": display_row, "Col": "T", "Field": "Current Health Plan Tier", "Value": raw, "Kind": "Auto-fix", "Issue": tier_note})
+
+            if fname in CLEARED_FIELDS:
                 if raw:
-                    clears.append(Issue(display_row, field_def.col, field_def.name, raw, "Cleared", f"Field '{field_def.name}' was cleared from output."))
-                new_row[field_def.name] = ""
+                    clears.append({"Row": display_row, "Col": field_def["col"], "Field": fname, "Value": raw, "Kind": "Cleared", "Issue": f"Field '{fname}' automatically cleared"})
+                new_row[fname] = ""
                 continue
 
-            fixed, note_list, error_list = validate_field(field_def, raw, options)
-            new_row[field_def.name] = fixed
-            for note in note_list:
-                fixes.append(Issue(display_row, field_def.col, field_def.name, raw, "Auto-fix", note))
-            for err in error_list:
-                errors.append(Issue(display_row, field_def.col, field_def.name, raw, "Error", err))
+            result = validate_cell(field_def, raw)
+            if not result["ok"]:
+                errors.append({"Row": display_row, "Col": field_def["col"], "Field": fname, "Value": raw, "Kind": "Error", "Issue": result["msg"]})
                 row_has_error = True
+                if field_def.get("type") == "zipcode":
+                    zip_fields_with_errors.add(fname)
+            if result["fix_note"]:
+                fixes.append({"Row": display_row, "Col": field_def["col"], "Field": fname, "Value": raw, "Kind": "Auto-fix", "Issue": result["fix_note"]})
+            new_row[fname] = result["fixed_val"] if result["ok"] else raw
 
-        if options.auto_fill_county_from_zip and zip_cache:
-            for zip_field, county_field in [("Zip Code", "County"), ("Primary Worksite Zip Code", "Primary Worksite County")]:
-                if new_row.get(zip_field) and not new_row.get(county_field):
-                    county = lookup_county(new_row[zip_field], zip_cache)
-                    if county:
-                        new_row[county_field] = county
-                        fixes.append(Issue(display_row, "-", county_field, "", "Auto-fix", f"County auto-filled from {zip_field} '{new_row[zip_field]}': '{county}'."))
-                    else:
-                        warnings.append(Issue(display_row, "-", zip_field, new_row[zip_field], "Warning", f"Zip code '{new_row[zip_field]}' was not found in the lookup table."))
+        if derived_tier_from_election and not new_row.get("Current Health Plan Tier", ""):
+            new_row["Current Health Plan Tier"] = derived_tier_from_election
 
-        er = new_row.get("Current Health Plan ER Cost", "")
-        ee = new_row.get("Current Health Plan EE Cost", "")
-        if bool(er) ^ bool(ee):
-            warnings.append(Issue(display_row, "Y/Z", "Cost Comparison", "", "Warning", "Both ER Cost and EE Cost should be present for cost comparison."))
+        if zip_cache:
+            for zip_fname, county_fname, col_letter in [
+                ("Zip Code", "County", "L"),
+                ("Primary Worksite Zip Code", "Primary Worksite County", "N"),
+            ]:
+                zv = new_row.get(zip_fname, "").strip()
+                if not zv or zip_fname in zip_fields_with_errors:
+                    continue
 
-        out_rows.append(new_row)
+                # Only lookup values that already passed U.S. ZIP format validation.
+                # Alphanumeric/non-U.S. postal codes and malformed ZIP values are
+                # already captured above as validation errors, so avoid adding a
+                # second lookup-related issue for the same bad value.
+                if not re.fullmatch(r"\d{5}", zv):
+                    continue
+
+                info = lookup_zip(zv, zip_cache)
+                if info:
+                    if not new_row.get(county_fname, "").strip() and info.get("county"):
+                        new_row[county_fname] = info["county"]
+                        fixes.append({"Row": display_row, "Col": "—", "Field": county_fname, "Value": "", "Kind": "Auto-fix", "Issue": f"County auto-filled from zip '{zv}': '{info['county']}'"})
+                else:
+                    errors.append({"Row": display_row, "Col": col_letter, "Field": zip_fname, "Value": zv, "Kind": "Error", "Issue": f"{zip_fname} '{zv}' is not a recognized U.S. ZIP code"})
+                    row_has_error = True
+
+        if new_row.get("Relationship") == "Employee":
+            employee_context = {
+                "Zip Code": new_row.get("Zip Code", ""),
+                "County": new_row.get("County", ""),
+                "Primary Worksite Zip Code": new_row.get("Primary Worksite Zip Code", ""),
+                "Primary Worksite County": new_row.get("Primary Worksite County", ""),
+                "ICHRA Class": new_row.get("ICHRA Class", ""),
+                "Health Election": new_row.get("Health Election", ""),
+                "Current Health Plan Tier": new_row.get("Current Health Plan Tier", ""),
+            }
+
+        pos = len(out_rows)
         if row_has_error:
-            error_positions.append(output_pos)
+            error_positions.append(pos)
         else:
-            valid_positions.append(output_pos)
+            valid_positions.append(pos)
+        out_rows.append(new_row)
 
-    return ProcessResult(
-        reformatted_df=pd.DataFrame(out_rows, columns=OUTPUT_COLUMNS),
-        errors=errors,
-        warnings=warnings,
-        fixes=fixes,
-        clears=clears,
-        mapping_notes=mapping_notes,
-        unrecognized_columns=unrecognized,
-        error_positions=error_positions,
-        valid_positions=valid_positions,
-        source_rows=len(df),
-        source_columns=len(df.columns),
-    )
+    er_fi = _FIELD_IDX_BY_NAME["Current Health Plan ER Cost"]
+    ee_fi = _FIELD_IDX_BY_NAME["Current Health Plan EE Cost"]
+    ci_er = col_map.get(er_fi)
+    ci_ee = col_map.get(ee_fi)
+    for df_ri, row in df.iterrows():
+        if all(str(v).strip() == "" for v in row):
+            continue
+        display_row = int(df_ri) + 2 + source_row_offset
+        er_v = str(row.iloc[ci_er]).strip() if ci_er is not None else ""
+        ee_v = str(row.iloc[ci_ee]).strip() if ci_ee is not None else ""
+        if bool(er_v) ^ bool(ee_v):
+            warnings.append({"Row": display_row, "Col": "Y/Z", "Field": "Cost Comparison", "Value": "", "Kind": "Warning", "Issue": "Both ER Cost and EE Cost should be present for Cost Comparison"})
 
-
-def process_dataframe(df: pd.DataFrame, options: Optional[EngineOptions] = None, zip_cache: Optional[dict[str, dict[str, str]]] = None) -> ProcessResult:
-    options = options or EngineOptions()
-    zip_cache = zip_cache or {}
-    try:
-        df = df.fillna("").astype(str)
-        if len(df) > options.max_file_rows:
-            raise ValueError(f"Input has {len(df)} rows, exceeding max_file_rows={options.max_file_rows}.")
-        if len(df.columns) > options.max_file_columns:
-            raise ValueError(f"Input has {len(df.columns)} columns, exceeding max_file_columns={options.max_file_columns}.")
-
-        mapping, unrecognized, mapping_notes = map_columns(df, options)
-        horizontal, reason = detect_horizontal(df, mapping, options)
-        if horizontal:
-            converted, notes = convert_horizontal_to_vertical(df, mapping, options)
-            result = validate_and_reformat(converted, options, zip_cache, already_canonical=True)
-            result.notes.extend(notes)
-            result.horizontal_used = True
-            result.detect_reason = reason
-            result.mapping_notes = mapping_notes
-            result.unrecognized_columns = unrecognized
-            result.source_rows = len(df)
-            result.source_columns = len(df.columns)
-            return result
-
-        result = validate_and_reformat(df, options, zip_cache, already_canonical=False)
-        result.horizontal_used = False
-        result.detect_reason = reason
-        return result
-    except Exception:
-        exception_text = traceback.format_exc()
-        LOGGER.exception("Census processing failed.")
-        return ProcessResult(
-            reformatted_df=pd.DataFrame(columns=OUTPUT_COLUMNS),
-            errors=[Issue("-", "-", "Engine", "", "Error", "Processing failed. Review exception text in diagnostics.")],
-            source_rows=len(df) if isinstance(df, pd.DataFrame) else 0,
-            source_columns=len(df.columns) if isinstance(df, pd.DataFrame) else 0,
-            exception_text=exception_text,
-        )
-
-
-def read_census_file(uploaded_file: Any) -> pd.DataFrame:
-    name = getattr(uploaded_file, "name", "uploaded.csv").lower()
-    if name.endswith(".csv"):
-        return pd.read_csv(uploaded_file, dtype=str, keep_default_na=False).fillna("").astype(str)
-    if name.endswith((".xlsx", ".xls")):
-        return pd.read_excel(uploaded_file, dtype=str, keep_default_na=False).fillna("").astype(str)
-    raise ValueError("Unsupported file type. Upload a CSV, XLSX, or XLS file.")
-
-
-def read_csv_text(text: str) -> pd.DataFrame:
-    return pd.read_csv(io.StringIO(text), dtype=str, keep_default_na=False).fillna("").astype(str)
-
-
-def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode("utf-8-sig")
-
+    reformatted_df = pd.DataFrame(out_rows, columns=OUTPUT_COLUMNS).reset_index(drop=True)
+    return {
+        "errors": errors,
+        "warnings": warnings,
+        "fixes": fixes,
+        "clears": clears,
+        "reformatted_df": reformatted_df,
+        "valid_positions": valid_positions,
+        "error_positions": error_positions,
+        "total_rows": len(out_rows),
+        "mapping_notes": mapping_notes,
+        "unrecognised_cols": unrecognised_cols,
+        "source_label": source_label,
+        "source_row_offset": source_row_offset,
+        "header_detection_note": header_detection_note,
+    }
 
 # =============================================================================
-# Built-in sample censuses
+# 10. DOWNLOAD HELPERS + SAMPLE DATA
 # =============================================================================
 
-
-SAMPLE_CENSUSES: dict[str, str] = {
-    "01_standard_vertical_clean": """First Name,Last Name,Relationship,DOB,Zip Code,Primary Worksite Zip Code,Health Election,Current Health Plan Tier\nJohn,Smith,Employee,01/01/1980,53202,53202,Enroll,Family\nJane,Smith,Spouse,02/02/1982,53202,53202,Enroll,\nTim,Smith,Child,03/03/2012,53202,53202,Enroll,\n""",
-    "02_vertical_informal_values": """first,last,rel,birthdate,zip,work zip,election,tier\nSam,Jones,ee,1980-01-15,601,601,e,ee only\nAlex,Jones,sp,1981-02-20,00601,00601,w,\n""",
-    "03_wide_employee_only_with_dependents": """Employee First,Employee Last,Employee DOB,Home Zip,Worksite Zip,Medical Plan,Medical Tier,Spouse DOB,Child 1 DOB,Child 2 DOB\nChris,Lee,01/01/1975,60601,60601,Gold PPO,Employee Only,02/02/1977,03/03/2010,04/04/2012\n""",
-    "04_wide_family": """Employee First Name,Employee Last Name,Employee DOB,Zip Code,Primary Worksite Zip Code,Current Medical Plan,Coverage Tier,Spouse First,Spouse Last,Spouse DOB,Child 1 First,Child 1 Last,Child 1 DOB\nPat,Miller,05/05/1985,77002,77002,Silver HMO,Fam,Riley,Miller,06/06/1986,Jordan,Miller,07/07/2015\n""",
-    "05_wide_employee_spouse": """First Name,Last Name,DOB,Zip,Work Zip,Health Plan,Tier,Spouse DOB,Child 1 DOB\nAvery,Brown,01/01/1990,30301,30301,Medical PPO,EE+SP,02/02/1991,03/03/2020\n""",
-    "06_wide_employee_children": """First Name,Last Name,DOB,Zip,Work Zip,Medical Plan,Medical Tier,Spouse DOB,Child 1 DOB,Child 2 DOB\nMorgan,Davis,01/01/1988,10001,10001,Medical EPO,EE+CH,02/02/1989,03/03/2011,04/04/2014\n""",
-    "07_rowwise_horizontal": """Employee First,Employee Last,Employee DOB,Home Zip,Worksite Zip,Current Health Plan,Current Health Plan Tier,Dependent Relationship,Dependent DOB\nTaylor,Wilson,01/01/1980,53202,53202,Gold PPO,Family,Spouse,02/02/1981\nTaylor,Wilson,01/01/1980,53202,53202,Gold PPO,Family,Child,03/03/2011\n""",
-    "08_missing_names_placeholders": """Employee DOB,Zip Code,Primary Worksite Zip Code,Medical Plan,Medical Tier,Spouse DOB,Child 1 DOB\n01/01/1970,75001,75001,Silver Plan,Family,02/02/1971,03/03/2010\n""",
-    "09_ancillary_noise_ignored": """First Name,Last Name,DOB,Zip,Work Zip,Medical Plan,Medical Tier,Dental Tier,Vision Election,Life Amount,Spouse DOB\nJamie,Garcia,01/01/1980,33101,33101,Medical Plan,Fam,Employee Only,Waive,50000,02/02/1982\n""",
-    "10_bad_zip_and_missing_dob": """First Name,Last Name,Relationship,DOB,Zip Code,Primary Worksite Zip Code,Health Election\nBad,Data,Employee,,WI,99999,Enroll\n""",
-    "11_excel_serial_dates": """First Name,Last Name,Relationship,DOB,Zip Code,Primary Worksite Zip Code,Health Election\nSerial,Date,Employee,29221,53202,53202,E\n""",
-    "12_zip_plus_four_and_currency": """First Name,Last Name,Relationship,DOB,Zip Code,Primary Worksite Zip Code,Health Election,Current Health Plan ER Cost,Current Health Plan EE Cost\nMoney,Case,Employee,01/01/1980,53202-1234,53202,$Enroll,$1,234.50,$250.00\n""".replace("$Enroll", "Enroll"),
-    "13_ineligible_horizontal_skipped": """First Name,Last Name,DOB,Zip,Work Zip,Medical Plan,Tier,Status,Spouse DOB\nSkip,Intern,01/01/2000,53202,53202,Gold,Family,Intern,02/02/2000\nKeep,Employee,01/01/1980,53202,53202,Gold,Family,Active,02/02/1980\n""",
-    "14_multiple_children_packed": """First Name,Last Name,DOB,Zip,Work Zip,Medical Plan,Tier,Child 1 DOB\nPack,Children,01/01/1980,60601,60601,Gold,Family,03/03/2010|04/04/2012;05/05/2014\n""",
-    "15_no_tier_infer_dependents": """First Name,Last Name,DOB,Zip,Work Zip,Medical Plan,Spouse DOB,Child 1 DOB\nNo,Tier,01/01/1980,78701,78701,Medical PPO,02/02/1981,03/03/2012\n""",
-    "16_waived_employee_dependents": """First Name,Last Name,DOB,Zip,Work Zip,Health Election,Medical Tier,Spouse DOB,Child 1 DOB\nWendy,Waive,01/01/1980,94105,94105,Waive,Family,02/02/1981,03/03/2010\n""",
-    "17_duplicate_dependent_rows": """Employee First,Employee Last,Employee DOB,Home Zip,Worksite Zip,Current Health Plan,Current Health Plan Tier,Dependent Relationship,Dependent DOB\nDrew,Repeat,01/01/1980,53202,53202,Gold PPO,Family,Child,03/03/2011\nDrew,Repeat,01/01/1980,53202,53202,Gold PPO,Family,Child,03/03/2011\n""",
-}
+def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8")
 
 
-def run_self_tests(options: Optional[EngineOptions] = None) -> pd.DataFrame:
-    options = options or EngineOptions(auto_fill_county_from_zip=False)
-    rows: list[dict[str, Any]] = []
-    for name, csv_text in SAMPLE_CENSUSES.items():
-        df = read_csv_text(csv_text)
-        result = process_dataframe(df, options=options, zip_cache={})
-        rows.append({
-            "Sample": name,
-            "Source Rows": result.source_rows,
-            "Output Rows": result.total_rows,
-            "Errors": len(result.errors),
-            "Warnings": len(result.warnings),
-            "Horizontal Used": result.horizontal_used,
-            "Detection Reason": result.detect_reason,
-            "Status": "Review" if result.errors else "Pass",
-        })
-    return pd.DataFrame(rows)
+def issues_to_csv_bytes(errors, warnings, fixes, clears, horizontal_notes=None) -> bytes:
+    cols = ["Row", "Col", "Field", "Value", "Kind", "Issue"]
+    combined = list(errors) + list(warnings) + list(fixes) + list(clears)
+    if horizontal_notes:
+        for n in horizontal_notes:
+            combined.append({"Row": "—", "Col": "—", "Field": "Horizontal conversion", "Value": "", "Kind": n.get("Kind", "Note"), "Issue": n.get("Issue", "")})
+    combined.sort(key=lambda x: (str(x.get("Row", "0")).zfill(6), x.get("Kind", ""), x.get("Field", "")))
+    return pd.DataFrame(combined, columns=cols).to_csv(index=False).encode("utf-8")
 
+
+SAMPLE_VERTICAL_CSV = """First Name,Last Name,Relationship,DOB,Zip Code,Primary Worksite Zip Code,ICHRA Class,Health Election,Current Health Plan Tier,Annual Salary
+John,Smith,Employee,01/15/1980,53201,53201,Group A,Enroll,Employee Only,75000
+Jane,Smith,Spouse,03/22/1982,53201,53201,Group A,Waive,,
+Tim,Smith,Child,06/10/2010,53201,53201,Group A,Waive,,
+"""
+
+SAMPLE_HORIZONTAL_CSV = """BIRTH DATE,PRIMARY ADDRESS LINE 1,PRIMARY ADDRESS - CITY,PRIMARY ADDRESS - STATE / TERRITORY,PRIMARY ADDRESS - ZIP CODE,WORKSITE ZIP CODE,WORKER CATEGORY,ANNUAL SALARY,MEDICAL PLAN NAME,MEDICAL COVERAGE TIER,Dependent Number,Dependent Relationship,Dependent DOB
+11/26/1986,10502 Barrichello St,Bakersfield,CA,93314,93314,F - Full Time,89139.96,HDHP HSA PRIME PLUS,Family,1,Child,3/4/2011
+11/26/1986,10502 Barrichello St,Bakersfield,CA,93314,93314,F - Full Time,89139.96,HDHP HSA PRIME PLUS,Family,2,Child,11/2/2008
+11/26/1986,10502 Barrichello St,Bakersfield,CA,93314,93314,F - Full Time,89139.96,HDHP HSA PRIME PLUS,Family,3,Spouse,6/30/1978
+1/26/1989,10503 Barrichello St,Bakersfield,CA,93314,93314,F - Full Time,133240.64,HDHP HSA PRIME PLUS,Employee + Children,1,Child,2/8/2014
+1/26/1989,10503 Barrichello St,Bakersfield,CA,93314,93314,F - Full Time,133240.64,HDHP HSA PRIME PLUS,Employee + Children,2,Child,2/16/2008
+"""
 
 # =============================================================================
-# Streamlit app wrapper
+# 11. STREAMLIT UI
 # =============================================================================
 
+def _style_issues(df_issues: list[dict[str, Any]]) -> "pd.io.formats.style.Styler":
+    cols = ["Row", "Col", "Field", "Value", "Kind", "Issue"]
+    df = pd.DataFrame(df_issues, columns=cols)
+    if df.empty:
+        df = pd.DataFrame(columns=cols)
+    df = df.sort_values(["Row", "Kind"], key=lambda s: s.map(lambda x: str(x).zfill(6) if str(x).isdigit() else str(x))).reset_index(drop=True)
 
-def build_options_from_sidebar() -> EngineOptions:
-    st.sidebar.header("Engine options")
-    mode = st.sidebar.selectbox("Input mode", [m.value for m in InputMode], index=0)
-    assumption_level = st.sidebar.slider("Assumption level", 0, 4, 2)
-    auto_fill_county = st.sidebar.checkbox("Auto-fill county from zip", True)
-    strict_health_only = st.sidebar.checkbox("Health-only horizontal conversion", True)
-    infer_dependents = st.sidebar.checkbox("Infer dependent enrollment when tier is blank", True)
-    placeholders = st.sidebar.checkbox("Create placeholder names when missing", True)
-    inherit_worksite = st.sidebar.checkbox("Inherit worksite zip to dependents", True)
-    exclude_ineligible = st.sidebar.checkbox("Exclude interns, contractors, inactive, and terminated rows", True)
-
-    with st.sidebar.expander("Advanced controls", expanded=False):
-        header_threshold = st.slider("Header match threshold", 70, 100, 88)
-        relationship_threshold = st.slider("Relationship match threshold", 70, 100, 86)
-        horizontal_sensitivity = st.slider("Horizontal detection sensitivity", 0, 5, 3)
-        max_rows = st.number_input("Maximum rows", min_value=1, max_value=1_000_000, value=250_000, step=10_000)
-        max_columns = st.number_input("Maximum columns", min_value=1, max_value=2_000, value=500, step=25)
-
-    return EngineOptions(
-        input_mode=InputMode(mode),
-        assumption_level=assumption_level,
-        header_match_threshold=header_threshold,
-        relationship_match_threshold=relationship_threshold,
-        horizontal_detection_sensitivity=horizontal_sensitivity,
-        auto_fill_county_from_zip=auto_fill_county,
-        strict_health_only=strict_health_only,
-        infer_dependents_enrolled_when_tier_missing=infer_dependents,
-        auto_placeholder_names=placeholders,
-        inherit_worksite_zip_to_dependents=inherit_worksite,
-        exclude_interns_contractors_inactive=exclude_ineligible,
-        max_file_rows=int(max_rows),
-        max_file_columns=int(max_columns),
-    )
-
-
-def render_metrics(result: ProcessResult) -> None:
-    cols = st.columns(8)
-    cols[0].metric("Source rows", result.source_rows)
-    cols[1].metric("Source columns", result.source_columns)
-    cols[2].metric("Output rows", result.total_rows)
-    cols[3].metric("Valid rows", len(result.valid_positions))
-    cols[4].metric("Error rows", len(result.error_positions))
-    cols[5].metric("Errors", len(result.errors))
-    cols[6].metric("Warnings", len(result.warnings))
-    cols[7].metric("Fixes", len(result.fixes))
-    status = "Review required" if result.has_errors else "Processed successfully"
-    st.write(f"Status: {status}")
-    st.write(f"Mode: {'Horizontal' if result.horizontal_used else 'Vertical'}")
-    st.caption(result.detect_reason)
-
-
-def render_downloads(result: ProcessResult) -> None:
-    st.subheader("Downloads")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.download_button("Full reformatted census", dataframe_to_csv_bytes(result.reformatted_df), "census_reformatted.csv", "text/csv", use_container_width=True)
-    c2.download_button("Valid rows only", dataframe_to_csv_bytes(result.valid_df), "census_valid_rows.csv", "text/csv", use_container_width=True)
-    c3.download_button("Error rows only", dataframe_to_csv_bytes(result.error_df), "census_error_rows.csv", "text/csv", use_container_width=True)
-    c4.download_button("Issue report", dataframe_to_csv_bytes(result.issue_frame()), "census_issue_report.csv", "text/csv", use_container_width=True)
-
-
-def render_result_tabs(result: ProcessResult) -> None:
-    issues = result.issue_frame()
-    tabs = st.tabs(["Reformatted output", "Issues", "Valid rows", "Error rows", "Diagnostics"])
-    with tabs[0]:
-        st.dataframe(result.reformatted_df, use_container_width=True, hide_index=True)
-    with tabs[1]:
-        if issues.empty:
-            st.success("No issues reported.")
-        else:
-            kinds = sorted(issues["Kind"].dropna().astype(str).unique().tolist())
-            selected = st.multiselect("Issue kinds", kinds, default=kinds)
-            view = issues[issues["Kind"].astype(str).isin(selected)] if selected else issues
-            st.dataframe(view, use_container_width=True, hide_index=True)
-    with tabs[2]:
-        st.dataframe(result.valid_df, use_container_width=True, hide_index=True)
-    with tabs[3]:
-        st.dataframe(result.error_df, use_container_width=True, hide_index=True)
-    with tabs[4]:
-        st.json(result.summary())
-        if result.mapping_notes:
-            st.write("Mapping notes")
-            st.write(result.mapping_notes)
-        if result.unrecognized_columns:
-            st.write("Unrecognized columns")
-            st.write(result.unrecognized_columns)
-        if result.exception_text:
-            st.code(result.exception_text)
-
-
-def load_zip_cache_safely(options: EngineOptions) -> dict[str, dict[str, str]]:
-    if not options.auto_fill_county_from_zip:
-        return {}
-    try:
-        return build_zip_cache()
-    except Exception:
-        LOGGER.exception("Could not build zip cache.")
-        st.warning("County auto-fill is unavailable. Processing will continue without zip lookup.")
-        return {}
+    def _color(val):
+        if val == "Error": return "color:#993C1D;font-weight:600"
+        if val == "Warning": return "color:#854F0B;font-weight:600"
+        if val == "Auto-fix": return "color:#3B6D11;font-weight:600"
+        if val == "Cleared": return "color:#555599;font-weight:600"
+        return ""
+    styler = df.style
+    return styler.map(_color, subset=["Kind"]) if hasattr(styler, "map") else styler.applymap(_color, subset=["Kind"])
 
 
 def main() -> None:
-    st.set_page_config(page_title="CSA Census Validator", layout="wide")
-    st.title("CSA Census Validator and Reformatter")
-    st.caption(f"Version {APP_VERSION}. Single-file test app with deployable processing engine.")
+    st.set_page_config(page_title="Census Validator", page_icon="📋", layout="wide")
+    st.markdown("""
+    <style>
+        .block-container { padding-top: 1.4rem; max-width: 1240px; }
+        [data-testid="metric-container"] { background:#f7f7f5; border-radius:8px; padding:10px 14px; }
+        .banner-ok { background:#EAF3DE; border:1px solid #97C459; border-radius:8px; padding:12px 16px; color:#3B6D11; font-size:14px; margin-bottom:1rem; }
+        .info-box { background:#EEF2FB; border:1px solid #ADC0EF; border-radius:8px; padding:12px 16px; font-size:13px; color:#1a3a7a; margin-bottom:1rem; }
+    </style>
+    """, unsafe_allow_html=True)
 
-    st.markdown(
-        """
-        <style>
-            .block-container { padding-top: 1.5rem; max-width: 1280px; }
-            [data-testid="metric-container"] { border: 1px solid #e5e7eb; border-radius: 8px; padding: 8px 12px; }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    st.title("Census Validator & Reformatter")
+    st.caption("Vertical CSA census validation · Horizontal dependent census conversion · Health-only plan/tier logic · System-ready CSV export")
 
-    options = build_options_from_sidebar()
+    with st.sidebar:
+        st.header("⚙️ Options")
+        input_mode = st.radio(
+            "Input format",
+            ["Auto-detect", "Standard vertical census", "Horizontal dependent census"],
+            index=0,
+            help="Horizontal mode converts dependents into separate rows under each employee.",
+        )
+        use_zip_lookup = st.toggle("Auto-fill County from Zip", value=ZIPCODES_AVAILABLE, disabled=not ZIPCODES_AVAILABLE)
+        if not ZIPCODES_AVAILABLE:
+            st.caption("Install `zipcodes` to enable county auto-fill.")
 
-    left, right = st.columns([2, 1], gap="large")
-    with left:
-        uploaded = st.file_uploader("Upload census file", type=["csv", "xlsx", "xls"])
-        pasted = st.text_area("Or paste CSV data", height=180, placeholder="Paste CSV text including a header row.")
-    with right:
-        sample_name = st.selectbox("Built-in sample census", [""] + sorted(SAMPLE_CENSUSES.keys()))
-        sample_text = SAMPLE_CENSUSES.get(sample_name, "")
-        if sample_text:
-            st.text_area("Sample preview", sample_text, height=220, disabled=True)
-
-    process_clicked = st.button("Process census", type="primary")
-    if process_clicked:
-        with st.spinner("Processing census"):
-            try:
-                if uploaded is not None:
-                    df_input = read_census_file(uploaded)
-                elif pasted.strip():
-                    df_input = read_csv_text(pasted)
-                elif sample_text.strip():
-                    df_input = read_csv_text(sample_text)
-                else:
-                    st.warning("Upload a file, paste CSV data, or select a sample census.")
-                    df_input = None
-                if df_input is not None:
-                    result = process_dataframe(df_input, options=options, zip_cache=load_zip_cache_safely(options))
-                    st.session_state["last_result"] = result
-            except Exception as exc:
-                st.error(f"Could not read or process input: {exc}")
-                with st.expander("Traceback", expanded=False):
-                    st.code(traceback.format_exc())
-
-    if "last_result" in st.session_state:
-        result = st.session_state["last_result"]
         st.divider()
-        render_metrics(result)
+        st.markdown("**Horizontal conversion**")
+        auto_placeholders = st.toggle("Create placeholder names when missing", value=True)
+        infer_missing_tier = st.toggle("Infer dependent enrollment when medical tier is missing", value=True,
+                                       help="If the file has a medical plan but no tier, listed dependents are treated as enrolled according to the dependent mix.")
+        inherit_worksite = st.toggle("Copy worksite zip to dependent rows", value=True,
+                                     help="Recommended because Primary Worksite Zip Code is required by the CSA import template.")
+        exclude_interns = st.toggle("Skip interns/contractors in horizontal mode", value=True)
+
         st.divider()
-        render_downloads(result)
-        st.divider()
-        render_result_tabs(result)
+        st.markdown("**Output column order**")
+        for i, fdef in enumerate(FIELDS, 1):
+            req = " ✳" if fdef["required"] else ""
+            cleared = " 🚫" if fdef["name"] in CLEARED_FIELDS else ""
+            st.caption(f"{i}. {fdef['name']}{req}{cleared}")
+        st.caption("✳ = Required   🚫 = Always cleared")
+
+    col_up, col_paste = st.columns([1, 1], gap="large")
+    with col_up:
+        uploaded = st.file_uploader("Upload census file (.csv / .xlsx / .xls)", type=["csv", "xlsx", "xls"])
+    with col_paste:
+        pasted = st.text_area("— or paste CSV data —", value=st.session_state.get("paste_text", ""), height=170, placeholder="Paste CSV including header row…")
+
+    b1, b2, b3, _ = st.columns([1, 1, 1, 5])
+    with b1:
+        run_btn = st.button("✅ Validate", type="primary", use_container_width=True)
+    with b2:
+        if st.button("📄 Load vertical sample", use_container_width=True):
+            st.session_state["paste_text"] = SAMPLE_VERTICAL_CSV
+            st.rerun()
+    with b3:
+        if st.button("↔️ Load horizontal sample", use_container_width=True):
+            st.session_state["paste_text"] = SAMPLE_HORIZONTAL_CSV
+            st.rerun()
+
+    if run_btn:
+        df_input = None
+        try:
+            if uploaded:
+                df_input = read_uploaded_file(uploaded)
+            elif pasted.strip():
+                df_input = _read_csv_text(pasted)
+            else:
+                st.warning("Please upload a file or paste CSV data first.")
+        except Exception as exc:
+            st.error(f"Could not read input: {exc}")
+
+        if df_input is not None:
+            with st.spinner("Validating and reformatting…"):
+                zc = build_zip_cache() if (use_zip_lookup and ZIPCODES_AVAILABLE) else {}
+                horizontal_detected, detect_reason = detect_horizontal_census(df_input)
+                force_horizontal = input_mode == "Horizontal dependent census"
+                force_vertical = input_mode == "Standard vertical census"
+                use_horizontal = force_horizontal or (horizontal_detected and not force_vertical)
+
+                horizontal_notes = []
+                conversion_summary = None
+                validation_input = df_input
+                source_label = "standard vertical census"
+
+                if use_horizontal:
+                    opts = HorizontalOptions(
+                        auto_placeholder_names=auto_placeholders,
+                        infer_dependents_enrolled_when_tier_missing=infer_missing_tier,
+                        inherit_worksite_zip_to_dependents=inherit_worksite,
+                        exclude_interns_and_contractors=exclude_interns,
+                    )
+                    conv = convert_horizontal_to_vertical(df_input, opts)
+                    validation_input = conv["converted_df"]
+                    horizontal_notes = conv["horizontal_notes"]
+                    conversion_summary = conv
+                    source_label = "horizontal dependent census"
+
+                results = run_validation(validation_input, zc, source_label=source_label)
+                if not results.get("header_detection_note"):
+                    results["header_detection_note"] = str(df_input.attrs.get("header_detection_note", "") or "")
+                ref_df = results["reformatted_df"]
+                results["valid_df"] = ref_df.iloc[results["valid_positions"]].reset_index(drop=True)
+                results["error_df"] = ref_df.iloc[results["error_positions"]].reset_index(drop=True)
+                results["horizontal_used"] = use_horizontal
+                results["detect_reason"] = detect_reason
+                results["horizontal_notes"] = horizontal_notes
+                results["conversion_summary"] = conversion_summary
+                st.session_state["results"] = results
+
+    if "results" not in st.session_state:
+        return
+
+    res = st.session_state["results"]
+    errors = res["errors"]
+    warnings = res["warnings"]
+    fixes = res["fixes"]
+    clears = res["clears"]
+    horizontal_notes = res.get("horizontal_notes", [])
+    ref_df = res["reformatted_df"]
+    valid_df = res["valid_df"]
+    error_df = res["error_df"]
+    total = res["total_rows"]
+    err_rows = len(res["error_positions"])
+    valid_rows = total - err_rows
 
     st.divider()
-    st.subheader("Built-in engine self-tests")
-    if st.button("Run all sample tests"):
-        st.session_state["self_tests"] = run_self_tests(options)
-    if "self_tests" in st.session_state:
-        tests = st.session_state["self_tests"]
-        st.dataframe(tests, use_container_width=True, hide_index=True)
-        st.download_button("Download self-test results", dataframe_to_csv_bytes(tests), "census_self_test_results.csv", "text/csv")
+    if res.get("header_detection_note"):
+        st.caption(res.get("header_detection_note"))
+    if res.get("horizontal_used"):
+        conv = res.get("conversion_summary") or {}
+        st.markdown(
+            f'<div class="info-box">↔️ Horizontal conversion applied: '
+            f'{conv.get("source_rows", "?")} source rows → {conv.get("employee_groups", "?")} employee groups → '
+            f'{conv.get("output_rows", total)} output rows. Dependents were ordered Employee, Spouse, Child.</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.caption(f"Input handled as standard vertical census. Detection note: {res.get('detect_reason', '')}")
+
+    if res.get("mapping_notes") or res.get("unrecognised_cols"):
+        with st.expander("🗺️ Column mapping notes", expanded=bool(res.get("unrecognised_cols"))):
+            for note in res.get("mapping_notes", []):
+                st.caption(f"• {note}")
+            for uc in res.get("unrecognised_cols", []):
+                st.caption(f"• Unrecognised: `{uc}`")
+
+    m1, m2, m3, m4, m5, m6, m7, m8 = st.columns(8)
+    m1.metric("Total rows", total)
+    m2.metric("✅ Valid rows", valid_rows)
+    m3.metric("❌ Error rows", err_rows)
+    m4.metric("Errors", len(errors))
+    m5.metric("Warnings", len(warnings) + len([n for n in horizontal_notes if n.get("Kind") == "Warning"]))
+    m6.metric("Auto-fixes", len(fixes) + len([n for n in horizontal_notes if n.get("Kind") == "Auto-fix"]))
+    m7.metric("Cleared fields", len(clears))
+    if res.get("horizontal_used"):
+        emp_count = int((ref_df["Relationship"] == "Employee").sum()) if "Relationship" in ref_df else 0
+        m8.metric("Employees", emp_count)
+    else:
+        m8.metric("Mode", "Vertical")
+
+    st.divider()
+    st.subheader("📥 Download")
+    st.caption("Canonical 30-column order · Dates normalised · Health Election normalised · Dependents expanded when horizontal mode is used")
+    dc1, dc2, dc3, dc4 = st.columns(4)
+    with dc1:
+        st.markdown("##### Full reformatted census")
+        st.caption(f"All {total} rows · ready for import")
+        st.download_button("⬇ Download", data=df_to_csv_bytes(ref_df), file_name="census_reformatted.csv", mime="text/csv", use_container_width=True, key="dl_full")
+    with dc2:
+        st.markdown("##### Valid rows only")
+        st.caption(f"{valid_rows} rows · no validation errors")
+        st.download_button("⬇ Download", data=df_to_csv_bytes(valid_df), file_name="census_valid_rows.csv", mime="text/csv", use_container_width=True, key="dl_valid")
+    with dc3:
+        st.markdown("##### Error rows only")
+        st.caption(f"{err_rows} rows · needs review")
+        st.download_button("⬇ Download", data=df_to_csv_bytes(error_df), file_name="census_error_rows.csv", mime="text/csv", use_container_width=True, key="dl_errors")
+    with dc4:
+        st.markdown("##### Validation report")
+        st.caption("Errors · warnings · fixes · clears · horizontal notes")
+        st.download_button("⬇ Download", data=issues_to_csv_bytes(errors, warnings, fixes, clears, horizontal_notes), file_name="census_validation_report.csv", mime="text/csv", use_container_width=True, key="dl_report")
+
+    st.divider()
+    horizontal_as_issues = [{"Row": "—", "Col": "—", "Field": "Horizontal conversion", "Value": "", "Kind": n.get("Kind", "Note"), "Issue": n.get("Issue", "")} for n in horizontal_notes]
+    all_issues = errors + warnings + fixes + clears + horizontal_as_issues
+    if not all_issues:
+        st.markdown(f'<div class="banner-ok">✅ All {total} rows passed validation with no issues.</div>', unsafe_allow_html=True)
+    else:
+        tab_all, tab_err, tab_warn, tab_fix, tab_clr = st.tabs([
+            f"All ({len(all_issues)})", f"❌ Errors ({len(errors)})", f"⚠️ Warnings ({len(warnings) + len([n for n in horizontal_notes if n.get('Kind') == 'Warning'])})",
+            f"🔧 Auto-fixes ({len(fixes) + len([n for n in horizontal_notes if n.get('Kind') == 'Auto-fix'])})", f"🚫 Cleared ({len(clears)})",
+        ])
+        with tab_all:
+            st.dataframe(_style_issues(all_issues), use_container_width=True, hide_index=True)
+        with tab_err:
+            st.dataframe(_style_issues(errors), use_container_width=True, hide_index=True) if errors else st.success("No errors found.")
+        with tab_warn:
+            warn_list = warnings + [x for x in horizontal_as_issues if x["Kind"] == "Warning"]
+            st.dataframe(_style_issues(warn_list), use_container_width=True, hide_index=True) if warn_list else st.success("No warnings found.")
+        with tab_fix:
+            fix_list = fixes + [x for x in horizontal_as_issues if x["Kind"] == "Auto-fix"]
+            st.dataframe(_style_issues(fix_list), use_container_width=True, hide_index=True) if fix_list else st.info("No auto-fixes applied.")
+        with tab_clr:
+            st.dataframe(_style_issues(clears), use_container_width=True, hide_index=True) if clears else st.info("No fields were cleared.")
+
+    st.divider()
+    with st.expander("🔍 Preview reformatted output", expanded=False):
+        st.dataframe(ref_df, use_container_width=True, hide_index=True)
 
 
 if __name__ == "__main__":
