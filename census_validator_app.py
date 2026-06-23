@@ -145,6 +145,7 @@ HEALTH_TERMS = {
 }
 
 HEADER_ALIASES: dict[str, str] = {
+    # First / Last name    
     "first name": "First Name",
     "firstname": "First Name",
     "first": "First Name",
@@ -153,7 +154,7 @@ HEADER_ALIASES: dict[str, str] = {
     "ee first name": "First Name",
     "member first name": "First Name",
     "subscriber first name": "First Name",
-
+    
     "last name": "Last Name",
     "lastname": "Last Name",
     "last": "Last Name",
@@ -163,7 +164,7 @@ HEADER_ALIASES: dict[str, str] = {
     "ee last name": "Last Name",
     "member last name": "Last Name",
     "subscriber last name": "Last Name",
-
+    # Employee ID
     "employee id": "Employee ID",
     "emp id": "Employee ID",
     "empid": "Employee ID",
@@ -175,31 +176,31 @@ HEADER_ALIASES: dict[str, str] = {
     "ee #": "Employee ID",
     "ee not ssn": "Employee ID",
     "ee # not ssn": "Employee ID",
-
+    # Relationship
     "relationship": "Relationship",
     "relation": "Relationship",
     "relationship to employee": "Relationship",
     "member type": "Relationship",
     "covered person type": "Relationship",
-
+    # DOB
     "dob": "DOB",
     "date of birth": "DOB",
     "birth date": "DOB",
     "birthdate": "DOB",
     "employee dob": "DOB",
     "employee date of birth": "DOB",
-
+    # gender
     "gender": "Gender",
     "sex": "Gender",
     "gender m f": "Gender",
     "gender male female": "Gender",
-
+    # Email
     "email": "Email",
     "email address": "Email",
     "e mail": "Email",
     "work email": "Email",
     "personal email": "Email",
-
+    # Address
     "address line 1": "Address Line 1",
     "address1": "Address Line 1",
     "street address": "Address Line 1",
@@ -211,7 +212,7 @@ HEADER_ALIASES: dict[str, str] = {
     "apt": "Address Line 2",
     "suite": "Address Line 2",
     "primary address line 2": "Address Line 2",
-
+    # City / State / Zip / County
     "city": "City",
     "town": "City",
     "primary address city": "City",
@@ -236,7 +237,7 @@ HEADER_ALIASES: dict[str, str] = {
     "county": "County",
     "home county": "County",
     "primary address county": "County",
-
+    # Worksite
     "primary worksite zip code": "Primary Worksite Zip Code",
     "worksite zip": "Primary Worksite Zip Code",
     "worksite zip code": "Primary Worksite Zip Code",
@@ -250,7 +251,7 @@ HEADER_ALIASES: dict[str, str] = {
     "worksite county": "Primary Worksite County",
     "work county": "Primary Worksite County",
     "work location county": "Primary Worksite County",
-
+    # Class
     "ichra class": "ICHRA Class",
     "ichra": "ICHRA Class",
     "class": "ICHRA Class",
@@ -259,14 +260,14 @@ HEADER_ALIASES: dict[str, str] = {
     "employee class": "ICHRA Class",
     "employee class name or #": "ICHRA Class",
     "employee class name or": "ICHRA Class",
-
+    # Health Election
     "health election": "Health Election",
     "election": "Health Election",
     "coverage election": "Health Election",
     "medical election": "Health Election",
     "benefit election": "Health Election",
     "medical coverage election": "Health Election",
-
+    # Health Plan Fields
     "current health vendor": "Current Health Plan Vendor",
     "current health plan vendor": "Current Health Plan Vendor",
     "health vendor": "Current Health Plan Vendor",
@@ -325,7 +326,7 @@ HEADER_ALIASES: dict[str, str] = {
     "employee cost": "Current Health Plan EE Cost",
     "employee contribution": "Current Health Plan EE Cost",
     "pending employee cost": "Current Health Plan EE Cost",
-
+    # Compensation
     "annual salary": "Annual Salary",
     "salary": "Annual Salary",
     "yearly salary": "Annual Salary",
@@ -339,7 +340,7 @@ HEADER_ALIASES: dict[str, str] = {
     "weekly hours": "Hours Per Week",
     "weekly hours worked": "Hours Per Week",
     "hrs per week": "Hours Per Week",
-
+    # Notes
     "notes": "Notes",
     "note": "Notes",
     "comments": "Notes",
