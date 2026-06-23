@@ -156,6 +156,10 @@ HEADER_ALIASES: dict[str, str] = {
     "employee #": "Employee ID", "worker id": "Employee ID", "person number": "Employee ID",
     # Relationship
     "relationship": "Relationship", "relation": "Relationship",
+    "relationship employee ee spouse sp or child ch": "Relationship",
+    "relationship employee spouse or child": "Relationship",
+    "Relationship Employee (EE), Spouse (SP), or Child (CH)": "Relationship",
+    "Relationship Employee, Spouse, or Child": "Relationship",  
     "dependent type": "Relationship", "member type": "Relationship", "covered person type": "Relationship",
     # DOB
     "dob": "DOB", "date of birth": "DOB", "birth date": "DOB", "birthdate": "DOB",
