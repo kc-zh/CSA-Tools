@@ -478,6 +478,9 @@ _TIER_EMP_CHILDREN = {"employee children", "employee child", "employee + childre
 _TIER_FAMILY = {"family", "employee family", "employee + family", "ee family", "ee + family", "employee spouse children", "employee + spouse + children", "employee spouse child", "ee spouse children", "ee + spouse + children", "ef", "fa", "fam"}
 _TIER_WAIVE = {"waive", "waived", "decline", "declined", "no coverage", "none", "not enrolled", "no election", "w", "wp"}
 
+VALID_HEALTH_PLAN_TIERS = {"Employee Only", "Employee + Spouse", "Employee + Children", "Family"}
+VALID_HEALTH_PLAN_TIERS_WITH_WAIVE = VALID_HEALTH_PLAN_TIERS | {"Waive"}
+
 
 def normalize_relationship(value: object) -> tuple[str, Optional[str]]:
     original = str(value or "").strip()
@@ -488,6 +491,17 @@ def normalize_relationship(value: object) -> tuple[str, Optional[str]]:
         canonical = _RELATIONSHIP_MAP[key]
         note = f"Relationship normalized: '{original}' -> '{canonical}'" if canonical.lower() != original.lower() else None
         return canonical, note
+
+    # Employer exports sometimes use compound relationship labels such as
+    # Spouse-Ex, Child-Step, Step-Child, or Child / Domestic Partner. The CSA
+    # import only accepts Employee, Spouse, or Child, so reduce obvious
+    # spouse/child compounds to the accepted values while keeping an auto-fix
+    # note in the report.
+    if re.search(r"\b(spouse|spse|sps|husband|wife|partner)\b", key):
+        return "Spouse", f"Relationship normalized: '{original}' -> 'Spouse'"
+    if re.search(r"\b(child|children|step|stepchild|daughter|son|dependent|dependant|dep)\b", key):
+        return "Child", f"Relationship normalized: '{original}' -> 'Child'"
+
     if FUZZY_AVAILABLE:
         match = rf_process.extractOne(key, _RELATIONSHIP_MAP.keys(), scorer=fuzz.ratio)
         if match:
@@ -1434,6 +1448,149 @@ def _append_issue(target: list[dict[str, Any]], row: Any, col: Any, field: str, 
     target.append({"Row": row, "Col": col, "Field": field, "Value": value, "Kind": kind, "Issue": issue})
 
 
+def _recognized_tier_or_blank(value: object) -> tuple[str, Optional[str]]:
+    """Return a valid canonical health-plan tier or blank.
+
+    The quoting import only accepts Employee Only, Employee + Spouse,
+    Employee + Children, and Family. Waive is accepted as an input synonym but
+    exported as blank because the CSA template uses Health Election for waive.
+    """
+    tier, note = normalize_tier(value)
+    if tier in VALID_HEALTH_PLAN_TIERS:
+        return tier, note
+    if tier == "Waive":
+        return "", note
+    return "", None
+
+
+def _clean_non_election_values_before_family_inference(rows: list[dict[str, str]], fixes: list[dict[str, Any]]) -> None:
+    """Treat non-election values in Health Election as missing when a plan exists.
+
+    Some files shift or duplicate the plan name into Health Election. If a
+    Current Health Plan is present, those values should not remain as invalid
+    elections. Clearing them allows the employee row to default to Enroll and
+    dependent rows to derive Enroll/Waive from the employee tier.
+    """
+    for idx, row in enumerate(rows):
+        output_row_num = idx + 2
+        raw_election = str(row.get("Health Election", "") or "").strip()
+        if not raw_election:
+            continue
+        canonical_election, election_note = normalize_election(raw_election)
+        if canonical_election in {"Enroll", "Waive"}:
+            if canonical_election != raw_election:
+                row["Health Election"] = canonical_election
+                _append_issue(
+                    fixes,
+                    output_row_num,
+                    "Q",
+                    "Health Election",
+                    raw_election,
+                    "Auto-fix",
+                    election_note or f"Health Election normalized: '{raw_election}' -> '{canonical_election}'",
+                )
+            continue
+        if str(row.get("Current Health Plan", "") or "").strip():
+            row["Health Election"] = ""
+            _append_issue(
+                fixes,
+                output_row_num,
+                "Q",
+                "Health Election",
+                raw_election,
+                "Auto-fix",
+                f"Health Election value '{raw_election}' is not Enroll/Waive; treated as missing because a Current Health Plan is present.",
+            )
+
+
+def _clean_non_tier_values_before_family_inference(rows: list[dict[str, str]], fixes: list[dict[str, Any]]) -> None:
+    """Treat non-tier values in Current Health Plan Tier as missing.
+
+    Some employer files put the medical plan name into both Current Health Plan
+    and Current Health Plan Tier. Without this pass, the validator sees a
+    non-empty tier and never infers Employee Only / Employee + Spouse /
+    Employee + Children / Family from the vertical family unit. This function
+    canonicalizes real tier values and clears anything that is not a tier when
+    a Current Health Plan is present.
+    """
+    for idx, row in enumerate(rows):
+        output_row_num = idx + 2
+        raw_tier = str(row.get("Current Health Plan Tier", "") or "").strip()
+        if not raw_tier:
+            continue
+
+        canonical_tier, tier_note = _recognized_tier_or_blank(raw_tier)
+        if canonical_tier:
+            if canonical_tier != raw_tier:
+                row["Current Health Plan Tier"] = canonical_tier
+                _append_issue(
+                    fixes,
+                    output_row_num,
+                    "T",
+                    "Current Health Plan Tier",
+                    raw_tier,
+                    "Auto-fix",
+                    tier_note or f"Current Health Plan Tier normalized: '{raw_tier}' -> '{canonical_tier}'",
+                )
+            continue
+
+        # If a plan exists but the tier value is not an accepted tier, treat it
+        # as a missing tier. This handles duplicated plan names and other plan
+        # descriptors that accidentally land in the tier column.
+        if str(row.get("Current Health Plan", "") or "").strip():
+            row["Current Health Plan Tier"] = ""
+            _append_issue(
+                fixes,
+                output_row_num,
+                "T",
+                "Current Health Plan Tier",
+                raw_tier,
+                "Auto-fix",
+                f"Current Health Plan Tier value '{raw_tier}' is not a recognized tier; treated as missing so the family-unit tier can be inferred.",
+            )
+
+
+def _employee_level_health_fields() -> list[str]:
+    return [
+        "Current Health Plan Vendor",
+        "Current Health Plan",
+        "Current Health Plan Tier",
+        "Current Health Plan OOP (single)",
+        "Current Health Plan OOP (family)",
+        "Current Health Plan Deductible (single)",
+        "Current Health Plan Deductible (family)",
+        "Current Health Plan ER Cost",
+        "Current Health Plan EE Cost",
+    ]
+
+
+def _clear_dependent_employee_level_plan_fields(rows: list[dict[str, str]], fixes: list[dict[str, Any]]) -> None:
+    """Clear employee-level current-plan fields on spouse/child rows.
+
+    The CSA import template expects current-plan/cost comparison details at the
+    employee row level. Dependents keep Relationship, DOB, ZIP/worksite fields,
+    ICHRA Class, and Health Election, while plan/tier/cost fields remain blank.
+    """
+    fields_to_clear = _employee_level_health_fields()
+    for idx, row in enumerate(rows):
+        if row.get("Relationship") not in {"Spouse", "Child"}:
+            continue
+        output_row_num = idx + 2
+        for field_name in fields_to_clear:
+            existing = str(row.get(field_name, "") or "").strip()
+            if existing:
+                row[field_name] = ""
+                _append_issue(
+                    fixes,
+                    output_row_num,
+                    "—",
+                    field_name,
+                    existing,
+                    "Auto-fix",
+                    f"Cleared employee-level {field_name} from dependent row.",
+                )
+
+
 def _vertical_family_units(rows: list[dict[str, str]]) -> list[tuple[int, list[int]]]:
     """Return employee rows paired with their following dependent rows.
 
@@ -1518,9 +1675,13 @@ def _apply_vertical_inheritance(rows: list[dict[str, str]], fixes: list[dict[str
     current_employee_row_num: Optional[int] = None
     inherited_fields = ["Zip Code", "County", "Primary Worksite Zip Code", "Primary Worksite County", "ICHRA Class"]
 
-    # Infer the employee tier before walking dependents so dependent Health
-    # Election can be derived from the completed Employee Only / Employee +
-    # Spouse / Employee + Children / Family tier.
+    # First clear/normalize values that are not real elections or tiers, such as
+    # files where the plan name was duplicated into Health Election and/or
+    # Current Health Plan Tier. Then infer the employee tier before walking
+    # dependents so dependent Health Election can be derived from the completed
+    # Employee Only / Employee + Spouse / Employee + Children / Family tier.
+    _clean_non_election_values_before_family_inference(rows, fixes)
+    _clean_non_tier_values_before_family_inference(rows, fixes)
     _infer_missing_vertical_employee_tiers(rows, fixes)
 
     for position, row in enumerate(rows):
@@ -1552,6 +1713,8 @@ def _apply_vertical_inheritance(rows: list[dict[str, str]], fixes: list[dict[str
                 derived = dependent_election_from_tier(employee_election, tier, relationship)
                 row["Health Election"] = derived
                 _append_issue(fixes, output_row_num, "Q", "Health Election", "", "Auto-fix", f"Dependent Health Election derived from employee tier '{tier or 'not provided'}' as '{derived}'")
+
+    _clear_dependent_employee_level_plan_fields(rows, fixes)
 
 
 def run_validation(df: pd.DataFrame, zip_cache: dict[str, dict[str, str]], *, source_label: str = "input") -> dict[str, Any]:
