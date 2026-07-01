@@ -1,4 +1,4 @@
-Census Validator
+Census Validator & Reformatter
 
 
 Beta Version: [https://github.com/kc-zh/CSA-Tools/blob/main/census_validator_Horizontal_census_handling.py](url)
