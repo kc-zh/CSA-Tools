@@ -109,7 +109,3 @@ Percent Change = ((Final Value - Initial Value) / |Initial Value|) × 100
 - A positive result indicates an increase
 - A negative result indicates a decrease
 """)
-
-# Footer
-st.markdown("---")
-st.markdown("Created with Streamlit and Python")
