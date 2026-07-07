@@ -475,14 +475,14 @@ _add_rel(
 
 _ELECTION_ENROLL = {
     "enroll", "enrolled", "e", "yes", "y", "participating", "active", "covered", "elect", "elected",
-    "ee", "eo", "es", "ec", "ech", "eech", "ef", "fa", "fam", "family",
+    "ee", "eo", "es", "ec", "ech", "eech", "ef", "fa", "fam", "family", "emp",
 }
 _ELECTION_WAIVE = {
     "waive", "waived", "w", "wp", "ie", "no", "n", "decline", "declined", "opt out", "optout",
     "not participating", "waiving", "waiting period", "in waiting period", "ineligible", "none",
 }
 
-_TIER_EMP_ONLY = {"employee only", "employee", "ee only", "employee only coverage", "single", "individual", "self only", "ee", "eo"}
+_TIER_EMP_ONLY = {"employee only", "employee", "ee only", "employee only coverage", "single", "individual", "self only", "ee", "eo", "emp"}
 _TIER_EMP_SPOUSE = {"employee spouse", "employee and spouse", "employee + spouse", "ee spouse", "ee + spouse", "ee sp", "employee plus spouse", "es"}
 _TIER_EMP_CHILDREN = {"employee children", "employee child", "employee + children", "employee + child", "ee children", "ee child", "ee + children", "ee + child", "employee plus children", "parent child", "parent children", "ec", "ech", "eech"}
 _TIER_FAMILY = {"family", "employee family", "employee + family", "ee family", "ee + family", "employee spouse children", "employee + spouse + children", "employee spouse child", "ee spouse children", "ee + spouse + children", "ef", "fa", "fam"}
