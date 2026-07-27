@@ -1211,7 +1211,11 @@ def find_dependent_slots(df: pd.DataFrame) -> tuple[list[DepSlot], bool]:
             slot = get_slot(f"spouse_{slot_number}", 100 + slot_number, "Spouse")
         else:
             is_child_header = bool(re.search(r"\b(child|children|ch)\b", hn))
-            default_rel = "Child" if is_child_header else ""
+            is_numbered_dependent_header = bool(
+                re.search(r"\b(dependent|dependant|dep)\b", hn)
+                and number != 999
+            )
+            default_rel = "Child" if (is_child_header or is_numbered_dependent_header) else ""
             slot = get_slot(f"dep_{number}", 200 + number, default_rel)
 
         if any(x in hn for x in ["dob", "date of birth", "birth date", "birthdate", "birth"]):
