@@ -264,6 +264,9 @@ HEADER_ALIASES: dict[str, str] = {
     "health election": "Health Election",
     "election": "Health Election",
     "coverage election": "Health Election",
+    "medical": "Health Election",
+    "medical coverage": "Health Election",
+    "medical coverage code": "Health Election",
     "medical election": "Health Election",
     "benefit election": "Health Election",
     "medical coverage election": "Health Election",
@@ -388,17 +391,24 @@ def _is_actual_dependent_header(header: object) -> bool:
         return False
     if _is_verbose_vertical_relationship_header(h):
         return False
+
+    # Some employer census templates use abbreviated child headers like
+    # "CH #1 DOB" / "CH#1 GENDER" rather than spelling out "Child".
+    # Treat those as dependent-specific headers only when they include a
+    # dependent attribute, so unrelated words containing "ch" do not trigger
+    # horizontal conversion.
     has_dependent_word = bool(re.search(r"\b(dependent|dependant|dep)\b", h))
     has_spouse_child_word = bool(re.search(r"\b(spouse|child|children|domestic partner)\b", h))
-    has_dependent_attribute = any(token in h for token in ["dob", "birth", "first", "last", "name", "relationship", "relation", "type"])
+    has_child_abbreviation = bool(re.search(r"\bch\b", h))
+    has_dependent_attribute = any(token in h for token in ["dob", "birth", "first", "last", "name", "relationship", "relation", "type", "gender"])
+
     if has_dependent_word and has_dependent_attribute:
         return True
-    if has_spouse_child_word and any(token in h for token in ["dob", "birth", "first", "last", "name"]):
+    if (has_spouse_child_word or has_child_abbreviation) and any(token in h for token in ["dob", "birth", "first", "last", "name", "gender"]):
         return True
-    if has_spouse_child_word and (h.endswith("relationship") or h.endswith("relation") or h.endswith("type")):
+    if (has_spouse_child_word or has_child_abbreviation) and (h.endswith("relationship") or h.endswith("relation") or h.endswith("type")):
         return True
     return False
-
 
 def canonical_from_header(header: object) -> Optional[str]:
     h = _norm(header)
@@ -465,18 +475,21 @@ _add_rel(
 
 _ELECTION_ENROLL = {
     "enroll", "enrolled", "e", "yes", "y", "participating", "active", "covered", "elect", "elected",
-    "ee", "eo", "es", "ec", "ech", "eech", "ef", "fa", "fam", "family",
+    "ee", "eo", "es", "ec", "ech", "eech", "ef", "fa", "fam", "family", "emp",
 }
 _ELECTION_WAIVE = {
     "waive", "waived", "w", "wp", "ie", "no", "n", "decline", "declined", "opt out", "optout",
     "not participating", "waiving", "waiting period", "in waiting period", "ineligible", "none",
 }
 
-_TIER_EMP_ONLY = {"employee only", "employee", "ee only", "employee only coverage", "single", "individual", "self only", "ee", "eo"}
+_TIER_EMP_ONLY = {"employee only", "employee", "ee only", "employee only coverage", "single", "individual", "self only", "ee", "eo", "emp"}
 _TIER_EMP_SPOUSE = {"employee spouse", "employee and spouse", "employee + spouse", "ee spouse", "ee + spouse", "ee sp", "employee plus spouse", "es"}
 _TIER_EMP_CHILDREN = {"employee children", "employee child", "employee + children", "employee + child", "ee children", "ee child", "ee + children", "ee + child", "employee plus children", "parent child", "parent children", "ec", "ech", "eech"}
 _TIER_FAMILY = {"family", "employee family", "employee + family", "ee family", "ee + family", "employee spouse children", "employee + spouse + children", "employee spouse child", "ee spouse children", "ee + spouse + children", "ef", "fa", "fam"}
 _TIER_WAIVE = {"waive", "waived", "decline", "declined", "no coverage", "none", "not enrolled", "no election", "w", "wp"}
+
+VALID_HEALTH_PLAN_TIERS = {"Employee Only", "Employee + Spouse", "Employee + Children", "Family"}
+VALID_HEALTH_PLAN_TIERS_WITH_WAIVE = VALID_HEALTH_PLAN_TIERS | {"Waive"}
 
 
 def normalize_relationship(value: object) -> tuple[str, Optional[str]]:
@@ -488,6 +501,17 @@ def normalize_relationship(value: object) -> tuple[str, Optional[str]]:
         canonical = _RELATIONSHIP_MAP[key]
         note = f"Relationship normalized: '{original}' -> '{canonical}'" if canonical.lower() != original.lower() else None
         return canonical, note
+
+    # Employer exports sometimes use compound relationship labels such as
+    # Spouse-Ex, Child-Step, Step-Child, or Child / Domestic Partner. The CSA
+    # import only accepts Employee, Spouse, or Child, so reduce obvious
+    # spouse/child compounds to the accepted values while keeping an auto-fix
+    # note in the report.
+    if re.search(r"\b(spouse|spse|sps|husband|wife|partner)\b", key):
+        return "Spouse", f"Relationship normalized: '{original}' -> 'Spouse'"
+    if re.search(r"\b(child|children|step|stepchild|daughter|son|dependent|dependant|dep)\b", key):
+        return "Child", f"Relationship normalized: '{original}' -> 'Child'"
+
     if FUZZY_AVAILABLE:
         match = rf_process.extractOne(key, _RELATIONSHIP_MAP.keys(), scorer=fuzz.ratio)
         if match:
@@ -705,12 +729,154 @@ def _dedupe_headers(headers: list[object]) -> list[str]:
     return output
 
 
+def _row_values_are_blank(values: list[object]) -> bool:
+    return all(str(value or "").strip() == "" for value in values)
+
+
+def _row_has_footer_marker(values: list[object]) -> bool:
+    row_text = " ".join(str(value or "").strip() for value in values if str(value or "").strip())
+    normalized = _norm(row_text)
+    if not normalized:
+        return False
+
+    footer_patterns = [
+        r"\bcoverage key\b",
+        r"\bcoverage legend\b",
+        r"\belection key\b",
+        r"\bbenefit key\b",
+        r"\binstructions?\b",
+        r"\bnotes?\b.*\bmust include\b",
+        r"\bmust include\b.*\b(date of birth|dob|gender)\b",
+        r"\bee employee only\b",
+        r"\besp employee spouse\b",
+        r"\bech employee child",
+        r"\bfam employee family\b",
+        r"\btotal employees?\b",
+        r"\btotal lives?\b",
+    ]
+    return any(re.search(pattern, normalized) for pattern in footer_patterns)
+
+
+def _looks_like_date_value(value: object) -> bool:
+    raw = str(value or "").strip()
+    if not raw:
+        return False
+    if re.fullmatch(r"\d{1,2}/\d{1,2}/\d{2,4}", raw):
+        return True
+    if re.fullmatch(r"\d{4}-\d{1,2}-\d{1,2}(\s+\d{1,2}:\d{2}:\d{2})?", raw):
+        return True
+    if re.fullmatch(r"\d{5}", raw):
+        # Could be either an Excel serial date or a ZIP. It still counts as a
+        # census signal when it appears under a DOB/birth-date column.
+        return True
+    try:
+        parsed = pd.to_datetime(raw, errors="coerce")
+        return pd.notna(parsed)
+    except Exception:
+        return False
+
+
+def _looks_like_zip_value(value: object) -> bool:
+    raw = str(value or "").strip()
+    if not raw:
+        return False
+    return bool(re.fullmatch(r"\d{5}(-?\d{4})?", raw) or re.fullmatch(r"\d{1,4}", raw))
+
+
+def _looks_like_coverage_code(value: object) -> bool:
+    compact = _compact(value)
+    return compact in {"ee", "eo", "es", "esp", "ec", "ech", "eech", "ef", "fa", "fam", "family", "waive", "w"}
+
+
+def _trim_census_body_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove title/footer material below the actual census body.
+
+    Header detection already handles extra rows above the census. This pass
+    handles the opposite problem: notes, coverage legends, and instruction blocks
+    below the census. It preserves the data body, stops after a clear blank gap,
+    and stops immediately when a footer marker such as "Coverage Key" appears.
+    """
+    if df.empty:
+        return df
+
+    headers = list(df.columns)
+    canonical_by_col = {col: canonical_from_header(col) for col in headers}
+    kept_indices: list[int] = []
+    data_started = False
+    consecutive_blank_after_data = 0
+
+    def row_has_census_signal(row: pd.Series) -> bool:
+        first_last_name_present = False
+        relationship_signal = False
+        date_signal = False
+        zip_signal = False
+        coverage_signal = False
+        dependent_signal = False
+
+        for col in headers:
+            value = str(row.get(col, "") or "").strip()
+            if not value:
+                continue
+            canonical = canonical_by_col.get(col)
+            header_norm = _norm(col)
+
+            if canonical in {"First Name", "Last Name"}:
+                first_last_name_present = True
+            if canonical == "Relationship":
+                rel, _ = normalize_relationship(value)
+                relationship_signal = rel in {"Employee", "Spouse", "Child"}
+            if canonical == "DOB" or "dob" in header_norm or "birth" in header_norm:
+                date_signal = _looks_like_date_value(value)
+            if canonical in {"Zip Code", "Primary Worksite Zip Code"} or "zip" in header_norm:
+                zip_signal = _looks_like_zip_value(value)
+            if canonical == "Health Election" or header_norm in {"medical", "medical coverage", "coverage"}:
+                coverage_signal = _looks_like_coverage_code(value) or normalize_election(value)[0] in {"Enroll", "Waive"}
+            if _is_actual_dependent_header(col):
+                dependent_signal = True
+
+        strong_signal = relationship_signal or date_signal or zip_signal or coverage_signal or dependent_signal
+        return strong_signal or (first_last_name_present and strong_signal)
+
+    for idx, row in df.iterrows():
+        values = row.tolist()
+        is_blank = _row_values_are_blank(values)
+
+        if is_blank:
+            if data_started:
+                consecutive_blank_after_data += 1
+                if consecutive_blank_after_data >= 2:
+                    break
+            continue
+
+        consecutive_blank_after_data = 0
+
+        if data_started and _row_has_footer_marker(values):
+            break
+
+        if row_has_census_signal(row):
+            kept_indices.append(idx)
+            data_started = True
+            continue
+
+        # A non-census row after data has started is usually a footer, legend,
+        # or note block. Stop instead of pushing it downstream as an employee.
+        if data_started:
+            break
+
+    if not kept_indices:
+        return df.loc[df.apply(lambda row: any(str(v).strip() for v in row), axis=1)].reset_index(drop=True)
+    return df.loc[kept_indices].reset_index(drop=True)
+
+
 def _finalize_raw_dataframe(raw: pd.DataFrame) -> pd.DataFrame:
     raw = raw.fillna("").astype(str)
     nonblank_mask = raw.apply(lambda row: any(str(v).strip() for v in row), axis=1)
-    raw = raw.loc[nonblank_mask].reset_index(drop=True)
-    if raw.empty:
+    if not nonblank_mask.any():
         return pd.DataFrame()
+
+    first_nonblank = int(nonblank_mask[nonblank_mask].index[0])
+    last_nonblank = int(nonblank_mask[nonblank_mask].index[-1])
+    raw = raw.iloc[first_nonblank:last_nonblank + 1].reset_index(drop=True)
 
     max_scan = min(len(raw), 30)
     scored = [(idx, _score_header_row(raw.iloc[idx].tolist())) for idx in range(max_scan)]
@@ -720,16 +886,14 @@ def _finalize_raw_dataframe(raw: pd.DataFrame) -> pd.DataFrame:
     headers = _dedupe_headers(raw.iloc[header_idx].tolist())
     df = raw.iloc[header_idx + 1:].reset_index(drop=True).copy()
     df.columns = headers
-    df = df.loc[df.apply(lambda row: any(str(v).strip() for v in row), axis=1)].reset_index(drop=True)
-    return df.fillna("").astype(str)
-
+    df = _trim_census_body_rows(df)
+    return df.fillna("").astype(str).reset_index(drop=True)
 
 def _read_csv_text(text: str) -> pd.DataFrame:
     delimiter = _detect_delimiter(text)
     reader = csv.reader(io.StringIO(text), delimiter=delimiter)
     rows = [list(row) for row in reader]
-    rows = [row for row in rows if any(str(cell).strip() for cell in row)]
-    if not rows:
+    if not rows or not any(any(str(cell).strip() for cell in row) for row in rows):
         return pd.DataFrame()
     max_width = max(len(row) for row in rows)
     normalized_rows = [row + [""] * (max_width - len(row)) for row in rows]
@@ -758,14 +922,48 @@ def _read_csv_with_fallback_encoding(file_obj) -> tuple[pd.DataFrame, str]:
         raise last_exc if last_exc else RuntimeError("Unable to decode uploaded file")
 
 
+def _read_excel_with_fallback(uploaded) -> pd.DataFrame:
+    raw_bytes = uploaded.read()
+    if isinstance(raw_bytes, str):
+        raw_bytes = raw_bytes.encode("utf-8")
+
+    last_exc: Optional[Exception] = None
+    for engine in [None, "openpyxl", "xlrd"]:
+        try:
+            bio = io.BytesIO(raw_bytes)
+            kwargs = {"dtype": str, "keep_default_na": False, "header": None}
+            if engine is not None:
+                kwargs["engine"] = engine
+            raw = pd.read_excel(bio, **kwargs)
+            return _finalize_raw_dataframe(raw)
+        except ImportError as exc:
+            last_exc = exc
+            continue
+        except ValueError as exc:
+            last_exc = exc
+            continue
+        except Exception as exc:
+            last_exc = exc
+            continue
+
+    msg = str(last_exc or "")
+    compound_file_signature = raw_bytes.startswith(b"\xd0\xcf\x11\xe0")
+    if compound_file_signature or "encrypted" in msg.lower() or "ole2 compound" in msg.lower():
+        raise ValueError(
+            "Could not read the uploaded Excel file. It appears to be encrypted, password-protected, "
+            "or not saved as a standard Excel workbook. Save a non-password-protected .xlsx or CSV copy "
+            "and upload that file."
+        ) from last_exc
+    raise ValueError(f"Could not read the uploaded Excel file: {last_exc}") from last_exc
+
+
 def read_uploaded_file(uploaded) -> pd.DataFrame:
     name = uploaded.name.lower()
     if name.endswith(".csv"):
         df, _ = _read_csv_with_fallback_encoding(uploaded)
         return df
     if name.endswith((".xlsx", ".xls")):
-        raw = pd.read_excel(uploaded, dtype=str, keep_default_na=False, header=None)
-        return _finalize_raw_dataframe(raw)
+        return _read_excel_with_fallback(uploaded)
     raise ValueError(f"Unsupported file type: {uploaded.name}")
 
 
@@ -902,6 +1100,24 @@ def _pick_col(
             return False
         return True
 
+    def contains_match(header_norm: str, alias_norm: str) -> bool:
+        if not alias_norm:
+            return False
+        if header_norm == alias_norm:
+            return True
+        if len(alias_norm) >= 4 and alias_norm in header_norm:
+            return True
+
+        # Avoid mapping generic one-word headers like "Medical" into every
+        # medical plan/cost field just because the alias contains the word
+        # "medical". Reverse containment is only safe for descriptive headers.
+        generic_headers = {"medical", "health", "plan", "coverage", "carrier", "name", "cost", "tier"}
+        if header_norm in generic_headers:
+            return False
+        if len(header_norm) >= 8 and len(header_norm.split()) >= 2 and header_norm in alias_norm:
+            return True
+        return False
+
     for alias in alias_norms:
         header = norm_to_header.get(alias)
         if header and allowed(header):
@@ -912,7 +1128,7 @@ def _pick_col(
             hn = _norm(header)
             if not allowed(header):
                 continue
-            if any(alias and len(alias) >= 4 and (alias in hn or hn in alias) for alias in alias_norms):
+            if any(contains_match(hn, alias) for alias in alias_norms):
                 return header
 
     if allow_fuzzy and FUZZY_AVAILABLE:
@@ -924,7 +1140,6 @@ def _pick_col(
                 if score >= 95:
                     return norm_to_header.get(best_norm)
     return None
-
 
 def build_horizontal_column_map(df: pd.DataFrame) -> HorizontalColumnMap:
     cm = HorizontalColumnMap()
@@ -945,7 +1160,7 @@ def build_horizontal_column_map(df: pd.DataFrame) -> HorizontalColumnMap:
     cm.ichra_class = _pick_col(df, ["ICHRA Class", "Benefit Class", "Employee Class", "Class"])
     cm.worker_category = _pick_col(df, ["WORKER CATEGORY", "Worker Category", "Employee Type", "Employment Type"])
     cm.position_status = _pick_col(df, ["POSITION STATUS", "Employment Status", "Status"])
-    cm.health_election = _pick_col(df, ["Health Election", "Medical Election", "Medical Coverage Election", "Coverage Election"], health_only=True)
+    cm.health_election = _pick_col(df, ["Health Election", "Medical", "Medical Coverage", "Medical Coverage Code", "Medical Election", "Medical Coverage Election", "Coverage Election"], health_only=True)
     cm.health_waive_reason = _pick_col(df, ["MEDICAL WAIVE REASON", "Health Waive Reason", "Waive Reason"], health_only=True)
     cm.plan_vendor = _pick_col(df, ["Current Health Plan Vendor", "Health Carrier", "Medical Carrier", "Carrier", "Medical Vendor"], health_only=True)
     cm.plan_name = _pick_col(df, ["Product Name", "Current Plan Name", "Current Product Name", "Medical Product Name", "Health Product Name"], health_only=True, allow_fuzzy=False) or _pick_col(df, ["MEDICAL PLAN NAME", "Medical Plan Name", "Health Plan Name", "Current Health Plan", "Plan Name"], health_only=True)
@@ -971,6 +1186,8 @@ def find_dependent_slots(df: pd.DataFrame) -> tuple[list[DepSlot], bool]:
     if row_rel or row_dob or row_first or row_last:
         return [DepSlot("rowwise", relationship_col=row_rel, dob_col=row_dob, first_col=row_first, last_col=row_last, number=1)], True
 
+    headers = list(df.columns)
+    header_positions = {header: idx for idx, header in enumerate(headers)}
     slots: dict[str, DepSlot] = {}
 
     def get_slot(key: str, number: int, default_relationship: str = "") -> DepSlot:
@@ -980,7 +1197,7 @@ def find_dependent_slots(df: pd.DataFrame) -> tuple[list[DepSlot], bool]:
             slots[key].default_relationship = default_relationship
         return slots[key]
 
-    for header in df.columns:
+    for header in headers:
         hn = _norm(header)
         if not _is_actual_dependent_header(header):
             continue
@@ -990,9 +1207,11 @@ def find_dependent_slots(df: pd.DataFrame) -> tuple[list[DepSlot], bool]:
         number = int(number_match.group(1)) if number_match else 999
 
         if "spouse" in hn or "domestic partner" in hn:
-            slot = get_slot(f"spouse_{number if number != 999 else 1}", 100 + (number if number != 999 else 1), "Spouse")
+            slot_number = number if number != 999 else 1
+            slot = get_slot(f"spouse_{slot_number}", 100 + slot_number, "Spouse")
         else:
-            default_rel = "Child" if "child" in hn or "children" in hn else ""
+            is_child_header = bool(re.search(r"\b(child|children|ch)\b", hn))
+            default_rel = "Child" if is_child_header else ""
             slot = get_slot(f"dep_{number}", 200 + number, default_rel)
 
         if any(x in hn for x in ["dob", "date of birth", "birth date", "birthdate", "birth"]):
@@ -1004,10 +1223,32 @@ def find_dependent_slots(df: pd.DataFrame) -> tuple[list[DepSlot], bool]:
         elif any(x in hn for x in ["relationship", "relation", "type"]):
             slot.relationship_col = header
 
+    # Many employer templates have a generic "Name" column immediately before
+    # each dependent DOB column, for example: Name, SPOUSE DOB, SPOUSE GENDER,
+    # Name, CH #1 DOB. Since duplicate headers are deduped as Name.1, Name.2,
+    # attach those generic name columns to the nearest dependent slot on their
+    # right.
+    generic_name_headers = [
+        header for header in headers
+        if re.fullmatch(r"name( \d+)?", _norm(header))
+    ]
+    for slot in slots.values():
+        if slot.first_col:
+            continue
+        anchor_col = slot.dob_col or slot.relationship_col or slot.last_col
+        if not anchor_col or anchor_col not in header_positions:
+            continue
+        anchor_idx = header_positions[anchor_col]
+        candidate_headers = [
+            header for header in generic_name_headers
+            if header_positions[header] < anchor_idx and anchor_idx - header_positions[header] <= 2
+        ]
+        if candidate_headers:
+            slot.first_col = sorted(candidate_headers, key=lambda h: anchor_idx - header_positions[h])[0]
+
     result = [slot for slot in slots.values() if slot.relationship_col or slot.dob_col or slot.first_col or slot.last_col]
     result.sort(key=lambda s: (0 if s.default_relationship == "Spouse" else 1, s.number, s.slot))
     return result, False
-
 
 def detect_horizontal_census(df: pd.DataFrame) -> tuple[bool, str]:
     headers = list(df.columns)
@@ -1183,12 +1424,13 @@ def convert_horizontal_to_vertical(df: pd.DataFrame, options: HorizontalOptions)
                     })
         else:
             for slot in dep_slots:
-                rel_raw = _cell(first_row, slot.relationship_col) or slot.default_relationship
+                explicit_rel_raw = _cell(first_row, slot.relationship_col)
                 dob = _cell(first_row, slot.dob_col)
                 first = _cell(first_row, slot.first_col)
                 last = _cell(first_row, slot.last_col)
-                if not any([rel_raw, dob, first, last]):
+                if not any([explicit_rel_raw, dob, first, last]):
                     continue
+                rel_raw = explicit_rel_raw or slot.default_relationship
                 relationship, note = normalize_relationship(rel_raw)
                 if note:
                     notes.append({"Kind": "Auto-fix", "Issue": f"Input row {idxs[0] + 2}: {note}"})
@@ -1274,6 +1516,19 @@ def convert_horizontal_to_vertical(df: pd.DataFrame, options: HorizontalOptions)
             dep_row["First Name"] = dep.get("First Name", "")
             dep_row["Last Name"] = dep.get("Last Name", "")
             dep_row["Relationship"] = dep.get("Relationship", "")
+
+            # Generic dependent "Name" columns are often first-name only. When
+            # a dependent has a name but no last name, inherit the employee last
+            # name. If the single name cell appears to contain a full name, split
+            # the final token into Last Name first.
+            if dep_row["First Name"] and not dep_row["Last Name"]:
+                name_parts = dep_row["First Name"].split()
+                if len(name_parts) >= 2:
+                    dep_row["First Name"] = " ".join(name_parts[:-1])
+                    dep_row["Last Name"] = name_parts[-1]
+                elif employee.get("Last Name"):
+                    dep_row["Last Name"] = employee["Last Name"]
+
             apply_placeholder(dep_row, dep_row["Relationship"] or "Dependent")
             dep_row["DOB"] = dep.get("DOB", "")
             dep_row["Zip Code"] = employee["Zip Code"]
@@ -1400,10 +1655,241 @@ def _append_issue(target: list[dict[str, Any]], row: Any, col: Any, field: str, 
     target.append({"Row": row, "Col": col, "Field": field, "Value": value, "Kind": kind, "Issue": issue})
 
 
+def _recognized_tier_or_blank(value: object) -> tuple[str, Optional[str]]:
+    """Return a valid canonical health-plan tier or blank.
+
+    The quoting import only accepts Employee Only, Employee + Spouse,
+    Employee + Children, and Family. Waive is accepted as an input synonym but
+    exported as blank because the CSA template uses Health Election for waive.
+    """
+    tier, note = normalize_tier(value)
+    if tier in VALID_HEALTH_PLAN_TIERS:
+        return tier, note
+    if tier == "Waive":
+        return "", note
+    return "", None
+
+
+def _clean_non_election_values_before_family_inference(rows: list[dict[str, str]], fixes: list[dict[str, Any]]) -> None:
+    """Treat non-election values in Health Election as missing when a plan exists.
+
+    Some files shift or duplicate the plan name into Health Election. If a
+    Current Health Plan is present, those values should not remain as invalid
+    elections. Clearing them allows the employee row to default to Enroll and
+    dependent rows to derive Enroll/Waive from the employee tier.
+    """
+    for idx, row in enumerate(rows):
+        output_row_num = idx + 2
+        raw_election = str(row.get("Health Election", "") or "").strip()
+        if not raw_election:
+            continue
+        canonical_election, election_note = normalize_election(raw_election)
+        if canonical_election in {"Enroll", "Waive"}:
+            if canonical_election != raw_election:
+                row["Health Election"] = canonical_election
+                _append_issue(
+                    fixes,
+                    output_row_num,
+                    "Q",
+                    "Health Election",
+                    raw_election,
+                    "Auto-fix",
+                    election_note or f"Health Election normalized: '{raw_election}' -> '{canonical_election}'",
+                )
+            continue
+        if str(row.get("Current Health Plan", "") or "").strip():
+            row["Health Election"] = ""
+            _append_issue(
+                fixes,
+                output_row_num,
+                "Q",
+                "Health Election",
+                raw_election,
+                "Auto-fix",
+                f"Health Election value '{raw_election}' is not Enroll/Waive; treated as missing because a Current Health Plan is present.",
+            )
+
+
+def _clean_non_tier_values_before_family_inference(rows: list[dict[str, str]], fixes: list[dict[str, Any]]) -> None:
+    """Treat non-tier values in Current Health Plan Tier as missing.
+
+    Some employer files put the medical plan name into both Current Health Plan
+    and Current Health Plan Tier. Without this pass, the validator sees a
+    non-empty tier and never infers Employee Only / Employee + Spouse /
+    Employee + Children / Family from the vertical family unit. This function
+    canonicalizes real tier values and clears anything that is not a tier when
+    a Current Health Plan is present.
+    """
+    for idx, row in enumerate(rows):
+        output_row_num = idx + 2
+        raw_tier = str(row.get("Current Health Plan Tier", "") or "").strip()
+        if not raw_tier:
+            continue
+
+        canonical_tier, tier_note = _recognized_tier_or_blank(raw_tier)
+        if canonical_tier:
+            if canonical_tier != raw_tier:
+                row["Current Health Plan Tier"] = canonical_tier
+                _append_issue(
+                    fixes,
+                    output_row_num,
+                    "T",
+                    "Current Health Plan Tier",
+                    raw_tier,
+                    "Auto-fix",
+                    tier_note or f"Current Health Plan Tier normalized: '{raw_tier}' -> '{canonical_tier}'",
+                )
+            continue
+
+        # If a plan exists but the tier value is not an accepted tier, treat it
+        # as a missing tier. This handles duplicated plan names and other plan
+        # descriptors that accidentally land in the tier column.
+        if str(row.get("Current Health Plan", "") or "").strip():
+            row["Current Health Plan Tier"] = ""
+            _append_issue(
+                fixes,
+                output_row_num,
+                "T",
+                "Current Health Plan Tier",
+                raw_tier,
+                "Auto-fix",
+                f"Current Health Plan Tier value '{raw_tier}' is not a recognized tier; treated as missing so the family-unit tier can be inferred.",
+            )
+
+
+def _employee_level_health_fields() -> list[str]:
+    return [
+        "Current Health Plan Vendor",
+        "Current Health Plan",
+        "Current Health Plan Tier",
+        "Current Health Plan OOP (single)",
+        "Current Health Plan OOP (family)",
+        "Current Health Plan Deductible (single)",
+        "Current Health Plan Deductible (family)",
+        "Current Health Plan ER Cost",
+        "Current Health Plan EE Cost",
+    ]
+
+
+def _clear_dependent_employee_level_plan_fields(rows: list[dict[str, str]], fixes: list[dict[str, Any]]) -> None:
+    """Clear employee-level current-plan fields on spouse/child rows.
+
+    The CSA import template expects current-plan/cost comparison details at the
+    employee row level. Dependents keep Relationship, DOB, ZIP/worksite fields,
+    ICHRA Class, and Health Election, while plan/tier/cost fields remain blank.
+    """
+    fields_to_clear = _employee_level_health_fields()
+    for idx, row in enumerate(rows):
+        if row.get("Relationship") not in {"Spouse", "Child"}:
+            continue
+        output_row_num = idx + 2
+        for field_name in fields_to_clear:
+            existing = str(row.get(field_name, "") or "").strip()
+            if existing:
+                row[field_name] = ""
+                _append_issue(
+                    fixes,
+                    output_row_num,
+                    "—",
+                    field_name,
+                    existing,
+                    "Auto-fix",
+                    f"Cleared employee-level {field_name} from dependent row.",
+                )
+
+
+def _vertical_family_units(rows: list[dict[str, str]]) -> list[tuple[int, list[int]]]:
+    """Return employee rows paired with their following dependent rows.
+
+    A vertical CSA census represents a family unit as one Employee row followed by
+    zero or more Spouse/Child rows. This helper keeps that grouping explicit so
+    tier inference can look at the entire family unit before dependent elections
+    are derived.
+    """
+    units: list[tuple[int, list[int]]] = []
+    current_employee_idx: Optional[int] = None
+    current_dependent_idxs: list[int] = []
+
+    for idx, row in enumerate(rows):
+        relationship = row.get("Relationship", "")
+        if relationship == "Employee":
+            if current_employee_idx is not None:
+                units.append((current_employee_idx, current_dependent_idxs))
+            current_employee_idx = idx
+            current_dependent_idxs = []
+        elif relationship in {"Spouse", "Child"} and current_employee_idx is not None:
+            current_dependent_idxs.append(idx)
+
+    if current_employee_idx is not None:
+        units.append((current_employee_idx, current_dependent_idxs))
+
+    return units
+
+
+def _describe_dependent_mix(dependents: list[dict[str, str]]) -> str:
+    spouse_count = sum(1 for dep in dependents if dep.get("Relationship") == "Spouse")
+    child_count = sum(1 for dep in dependents if dep.get("Relationship") == "Child")
+    parts: list[str] = []
+    if spouse_count:
+        parts.append(f"{spouse_count} spouse" if spouse_count == 1 else f"{spouse_count} spouses")
+    if child_count:
+        parts.append(f"{child_count} child" if child_count == 1 else f"{child_count} children")
+    return " and ".join(parts) if parts else "no spouse/child dependents"
+
+
+def _infer_missing_vertical_employee_tiers(rows: list[dict[str, str]], fixes: list[dict[str, Any]]) -> None:
+    """Infer missing employee Current Health Plan Tier from vertical family units.
+
+    When an employee has Current Health Plan populated but Current Health Plan
+    Tier is blank, the safest available assumption is the coverage composition
+    represented by that employee's family unit:
+    - Employee only: no spouse/child rows
+    - Employee + Spouse: spouse row and no child rows
+    - Employee + Children: child row(s) and no spouse row
+    - Family: spouse row and child row(s)
+    """
+    for employee_idx, dependent_idxs in _vertical_family_units(rows):
+        employee = rows[employee_idx]
+        output_row_num = employee_idx + 2
+        if employee.get("Current Health Plan Tier", "").strip():
+            continue
+        if not employee.get("Current Health Plan", "").strip():
+            continue
+        if employee.get("Health Election", "") == "Waive":
+            continue
+
+        dependents = [
+            {"Relationship": rows[dep_idx].get("Relationship", "")}
+            for dep_idx in dependent_idxs
+            if rows[dep_idx].get("Relationship", "") in {"Spouse", "Child"}
+        ]
+        inferred_tier = _infer_tier_from_dependents(dependents)
+        employee["Current Health Plan Tier"] = inferred_tier
+        mix_description = _describe_dependent_mix(dependents)
+        _append_issue(
+            fixes,
+            output_row_num,
+            "T",
+            "Current Health Plan Tier",
+            "",
+            "Auto-fix",
+            f"Employee Current Health Plan Tier inferred as '{inferred_tier}' because Current Health Plan is present, tier is missing, and the family unit includes {mix_description}.",
+        )
+
+
 def _apply_vertical_inheritance(rows: list[dict[str, str]], fixes: list[dict[str, Any]], warnings: list[dict[str, Any]]) -> None:
     current_employee: Optional[dict[str, str]] = None
     current_employee_row_num: Optional[int] = None
     inherited_fields = ["Zip Code", "County", "Primary Worksite Zip Code", "Primary Worksite County", "ICHRA Class"]
+
+    # First clear/normalize values that are not real elections or tiers, such as
+    # files where the plan name was duplicated into Health Election and/or
+    # Current Health Plan Tier. Then infer the employee tier before walking
+    # dependents so dependent Health Election can be derived from the completed
+    # Employee Only / Employee + Spouse / Employee + Children / Family tier.
+    _clean_non_election_values_before_family_inference(rows, fixes)
+    _clean_non_tier_values_before_family_inference(rows, fixes)
+    _infer_missing_vertical_employee_tiers(rows, fixes)
 
     for position, row in enumerate(rows):
         output_row_num = position + 2
@@ -1434,6 +1920,8 @@ def _apply_vertical_inheritance(rows: list[dict[str, str]], fixes: list[dict[str
                 derived = dependent_election_from_tier(employee_election, tier, relationship)
                 row["Health Election"] = derived
                 _append_issue(fixes, output_row_num, "Q", "Health Election", "", "Auto-fix", f"Dependent Health Election derived from employee tier '{tier or 'not provided'}' as '{derived}'")
+
+    _clear_dependent_employee_level_plan_fields(rows, fixes)
 
 
 def run_validation(df: pd.DataFrame, zip_cache: dict[str, dict[str, str]], *, source_label: str = "input") -> dict[str, Any]:
@@ -1595,11 +2083,17 @@ def issues_to_csv_bytes(errors, warnings, fixes, clears, horizontal_notes=None) 
     return pd.DataFrame(combined, columns=cols).to_csv(index=False).encode("utf-8")
 
 
-SAMPLE_VERTICAL_CSV = """First Name,Last Name,"Relationship Employee (EE), Spouse (SP), or Child (CH)",Date of Birth,Home Zip Code,Work Zip Code,Employee Class (Name or #),Weekly Hours Worked,Medical Election,Medical Plan Name,Annual Salary
-Musa T.,Abdelhadi,Employee,06/11/1980,75126,75243,Full Time Benefits Eligible,40,EE,Buy-Up PPO,127000.02
-Neveen,Shalabi,Spouse,08/01/1979,,,,,,,
-Mohammod,Abdelhadi,Child,11/16/2002,,,,,,,
-Danya,Abdelhadi,Child,04/12/2004,,,,,,,
+SAMPLE_VERTICAL_CSV = """First Name,Last Name,"Relationship Employee (EE), Spouse (SP), or Child (CH)",Date of Birth,Home Zip Code,Work Zip Code,Employee Class (Name or #),Weekly Hours Worked,Medical Election,Medical Plan Name,Current Health Plan Tier,Annual Salary
+Musa T.,Abdelhadi,Employee,06/11/1980,75126,75243,Full Time Benefits Eligible,40,Enroll,Buy-Up PPO,,127000.02
+Neveen,Shalabi,Spouse,08/01/1979,,,,,,,,
+Mohammod,Abdelhadi,Child,11/16/2002,,,,,,,,
+Danya,Abdelhadi,Child,04/12/2004,,,,,,,,
+Alex,EmployeeOnly,Employee,02/10/1984,53201,53201,Full Time Benefits Eligible,40,Enroll,Base PPO,,82000
+Jamie,SpouseOnly,Employee,03/12/1979,60601,60601,Full Time Benefits Eligible,40,Enroll,Base PPO,,91000
+Jordan,SpouseOnly,Spouse,08/15/1980,,,,,,,,
+Taylor,ChildrenOnly,Employee,04/14/1986,75243,75243,Full Time Benefits Eligible,40,Enroll,Base PPO,,87000
+Morgan,ChildrenOnly,Child,09/22/2014,,,,,,,,
+Riley,ChildrenOnly,Child,01/05/2017,,,,,,,,
 """
 
 SAMPLE_HORIZONTAL_CSV = """BIRTH DATE,PRIMARY ADDRESS LINE 1,PRIMARY ADDRESS - CITY,PRIMARY ADDRESS - STATE / TERRITORY,PRIMARY ADDRESS - ZIP CODE,WORKSITE ZIP CODE,WORKER CATEGORY,ANNUAL SALARY,MEDICAL PLAN NAME,MEDICAL COVERAGE TIER,Dependent Number,Dependent Relationship,Dependent DOB
@@ -1682,7 +2176,7 @@ def main() -> None:
     )
 
     st.title("Census Validator & Reformatter")
-    st.caption("Vertical CSA census validation, horizontal dependent conversion, header-row detection, and system-ready CSV export")
+    st.caption("Vertical CSA census validation, horizontal dependent conversion, header/footer row detection, and system-ready CSV export")
 
     with st.sidebar:
         st.header("Options")
