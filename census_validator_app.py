@@ -331,6 +331,7 @@ HEADER_ALIASES: dict[str, str] = {
     "pending employee cost": "Current Health Plan EE Cost",
     # Compensation
     "annual salary": "Annual Salary",
+    "gross annual earnings": "Annual Salary",
     "salary": "Annual Salary",
     "yearly salary": "Annual Salary",
     "base salary": "Annual Salary",
