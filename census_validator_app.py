@@ -299,7 +299,7 @@ HEADER_ALIASES: dict[str, str] = {
     "tier": "Current Health Plan Tier",
     "medical coverage tier": "Current Health Plan Tier",
     "medical coverage level": "Current Health Plan Tier",
-    "Medical Plan Coverage": "Current Health Plan Tier",
+    "medical plan coverage": "Current Health Plan Tier",
 
     "current health plan oop single": "Current Health Plan OOP (single)",
     "health plan oop single": "Current Health Plan OOP (single)",
