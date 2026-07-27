@@ -1174,7 +1174,7 @@ def build_horizontal_column_map(df: pd.DataFrame) -> HorizontalColumnMap:
     cm.ded_family = _pick_col(df, ["Current Health Plan Deductible (family)", "Medical Deductible Family", "Deductible Family"], health_only=True)
     cm.er_cost = _pick_col(df, ["Current Health Plan ER Cost", "Medical ER Cost", "Employer Cost", "Pending Employer Cost", "Employer Contribution"], health_only=True, allow_fuzzy=False)
     cm.ee_cost = _pick_col(df, ["Current Health Plan EE Cost", "Medical EE Cost", "Employee Cost", "Pending Employee Cost", "Employee Contribution"], health_only=True, allow_fuzzy=False)
-    cm.annual_salary = _pick_col(df, ["ANNUAL SALARY", "Annual Salary", "Salary", "Base Salary"])
+    cm.annual_salary = _pick_col(df, ["ANNUAL SALARY", "Annual Salary", "Salary", "Base Salary", "Annual Base Salary"])
     cm.hourly_rate = _pick_col(df, ["Hourly Rate", "Hourly Wage"])
     cm.hours_per_week = _pick_col(df, ["Hours Per Week", "Weekly Hours", "Weekly Hours Worked"])
     cm.notes = _pick_col(df, ["Notes", "Comments", "Remarks"])
