@@ -1167,7 +1167,7 @@ def build_horizontal_column_map(df: pd.DataFrame) -> HorizontalColumnMap:
     cm.health_waive_reason = _pick_col(df, ["MEDICAL WAIVE REASON", "Health Waive Reason", "Waive Reason"], health_only=True)
     cm.plan_vendor = _pick_col(df, ["Current Health Plan Vendor", "Health Carrier", "Medical Carrier", "Carrier", "Medical Vendor"], health_only=True)
     cm.plan_name = _pick_col(df, ["Product Name", "Current Plan Name", "Current Product Name", "Medical Product Name", "Health Product Name"], health_only=True, allow_fuzzy=False) or _pick_col(df, ["MEDICAL PLAN NAME", "Medical Plan Name", "Health Plan Name", "Current Health Plan", "Plan Name"], health_only=True)
-    cm.plan_tier = _pick_col(df, ["Current Health Plan Tier", "Medical Plan Tier", "Medical Coverage Tier", "Coverage Tier", "Coverage Level", "Benefit Tier", "Election Tier"], health_only=True)
+    cm.plan_tier = _pick_col(df, ["Current Health Plan Tier", "Medical Plan Tier", "Medical Plan Coverage", "Medical Coverage Tier", "Coverage Tier", "Coverage Level", "Benefit Tier", "Election Tier"], health_only=True)
     cm.oop_single = _pick_col(df, ["Current Health Plan OOP (single)", "Medical OOP Single", "OOP Single"], health_only=True)
     cm.oop_family = _pick_col(df, ["Current Health Plan OOP (family)", "Medical OOP Family", "OOP Family"], health_only=True)
     cm.ded_single = _pick_col(df, ["Current Health Plan Deductible (single)", "Medical Deductible Single", "Deductible Single"], health_only=True)
