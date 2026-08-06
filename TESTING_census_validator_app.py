@@ -333,7 +333,7 @@ HEADER_ALIASES: dict[str, str] = {
     # Compensation
     "annual salary": "Annual Salary",
     "gross annual earnings": "Annual Salary",
-    "Base Annual Earnings": "Annual Salary",
+    "base annual earnings": "Annual Salary",
     "salary": "Annual Salary",
     "yearly salary": "Annual Salary",
     "annual base salary": "Annual Salary",
