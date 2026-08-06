@@ -18,7 +18,7 @@ from __future__ import annotations
 import csv
 import io
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import pandas as pd
@@ -299,6 +299,7 @@ HEADER_ALIASES: dict[str, str] = {
     "tier": "Current Health Plan Tier",
     "medical coverage tier": "Current Health Plan Tier",
     "medical coverage level": "Current Health Plan Tier",
+    "medical plan coverage": "Current Health Plan Tier",
 
     "current health plan oop single": "Current Health Plan OOP (single)",
     "health plan oop single": "Current Health Plan OOP (single)",
@@ -331,8 +332,10 @@ HEADER_ALIASES: dict[str, str] = {
     "pending employee cost": "Current Health Plan EE Cost",
     # Compensation
     "annual salary": "Annual Salary",
+    "gross annual earnings": "Annual Salary",
     "salary": "Annual Salary",
     "yearly salary": "Annual Salary",
+    "annual base salary": "Annual Salary",
     "base salary": "Annual Salary",
     "hourly rate": "Hourly Rate",
     "hourly": "Hourly Rate",
@@ -1037,6 +1040,7 @@ class HorizontalOptions:
 class HorizontalColumnMap:
     employee_first: Optional[str] = None
     employee_last: Optional[str] = None
+    employee_name: Optional[str] = None
     employee_id: Optional[str] = None
     employee_dob: Optional[str] = None
     employee_gender: Optional[str] = None
@@ -1053,10 +1057,13 @@ class HorizontalColumnMap:
     worker_category: Optional[str] = None
     position_status: Optional[str] = None
     health_election: Optional[str] = None
+    health_election_cols: list[str] = field(default_factory=list)
     health_waive_reason: Optional[str] = None
     plan_vendor: Optional[str] = None
     plan_name: Optional[str] = None
+    plan_name_cols: list[str] = field(default_factory=list)
     plan_tier: Optional[str] = None
+    plan_tier_cols: list[str] = field(default_factory=list)
     oop_single: Optional[str] = None
     oop_family: Optional[str] = None
     ded_single: Optional[str] = None
@@ -1077,10 +1084,30 @@ class DepSlot:
     dob_col: Optional[str] = None
     first_col: Optional[str] = None
     last_col: Optional[str] = None
+    name_col: Optional[str] = None
+    gender_col: Optional[str] = None
+    covered_col: Optional[str] = None
+    cobra_col: Optional[str] = None
     default_relationship: str = ""
 
 
-def _pick_col(
+def _base_header_norm(header: object) -> str:
+    """Normalize a header while ignoring pandas-style duplicate suffixes.
+
+    Excel exports frequently repeat headers such as ``Medical Plan`` or
+    ``Dependent Name``. The ingestion layer preserves them as ``.1``, ``.2``,
+    etc. This helper lets the mapper recognize every repeated copy without
+    changing the original column order.
+    """
+    return re.sub(r"\s+\d+$", "", _norm(header)).strip()
+
+
+def _duplicate_header_number(header: object) -> int:
+    match = re.search(r"\.(\d+)$", str(header or "").strip())
+    return int(match.group(1)) if match else 0
+
+
+def _pick_cols(
     df: pd.DataFrame,
     aliases: list[str],
     *,
@@ -1088,10 +1115,9 @@ def _pick_col(
     dependent_only: bool = False,
     allow_contains: bool = True,
     allow_fuzzy: bool = True,
-) -> Optional[str]:
-    headers = list(df.columns)
-    norm_to_header: dict[str, str] = {_norm(h): h for h in headers}
-    alias_norms = [_norm(a) for a in aliases]
+) -> list[str]:
+    headers = [str(header) for header in df.columns]
+    alias_norms = [_norm(alias) for alias in aliases]
 
     def allowed(header: str) -> bool:
         if health_only and not _looks_health_header(header):
@@ -1108,70 +1134,123 @@ def _pick_col(
         if len(alias_norm) >= 4 and alias_norm in header_norm:
             return True
 
-        # Avoid mapping generic one-word headers like "Medical" into every
-        # medical plan/cost field just because the alias contains the word
-        # "medical". Reverse containment is only safe for descriptive headers.
         generic_headers = {"medical", "health", "plan", "coverage", "carrier", "name", "cost", "tier"}
         if header_norm in generic_headers:
             return False
-        if len(header_norm) >= 8 and len(header_norm.split()) >= 2 and header_norm in alias_norm:
-            return True
-        return False
+        return len(header_norm) >= 8 and len(header_norm.split()) >= 2 and header_norm in alias_norm
 
-    for alias in alias_norms:
-        header = norm_to_header.get(alias)
-        if header and allowed(header):
-            return header
+    matches: list[str] = []
+    for header in headers:
+        if not allowed(header):
+            continue
+        header_norm = _norm(header)
+        base_norm = _base_header_norm(header)
+        if any(header_norm == alias or base_norm == alias for alias in alias_norms):
+            matches.append(header)
 
-    if allow_contains:
+    if not matches and allow_contains:
         for header in headers:
-            hn = _norm(header)
             if not allowed(header):
                 continue
-            if any(contains_match(hn, alias) for alias in alias_norms):
-                return header
+            header_norm = _norm(header)
+            base_norm = _base_header_norm(header)
+            if any(contains_match(header_norm, alias) or contains_match(base_norm, alias) for alias in alias_norms):
+                matches.append(header)
 
-    if allow_fuzzy and FUZZY_AVAILABLE:
-        searchable = [_norm(h) for h in headers if allowed(h)]
+    if not matches and allow_fuzzy and FUZZY_AVAILABLE:
+        searchable = [(header, _base_header_norm(header)) for header in headers if allowed(header)]
         for alias in alias_norms:
-            match = rf_process.extractOne(alias, searchable, scorer=fuzz.token_sort_ratio)
+            if not searchable:
+                break
+            match = rf_process.extractOne(alias, [item[1] for item in searchable], scorer=fuzz.token_sort_ratio)
             if match:
-                best_norm, score, _ = match
+                _, score, match_index = match
                 if score >= 95:
-                    return norm_to_header.get(best_norm)
-    return None
+                    matches.append(searchable[match_index][0])
+                    break
+
+    # Preserve source-column order and remove any accidental duplicates.
+    return list(dict.fromkeys(matches))
+
+
+def _pick_col(
+    df: pd.DataFrame,
+    aliases: list[str],
+    *,
+    health_only: bool = False,
+    dependent_only: bool = False,
+    allow_contains: bool = True,
+    allow_fuzzy: bool = True,
+) -> Optional[str]:
+    matches = _pick_cols(
+        df,
+        aliases,
+        health_only=health_only,
+        dependent_only=dependent_only,
+        allow_contains=allow_contains,
+        allow_fuzzy=allow_fuzzy,
+    )
+    return matches[0] if matches else None
+
 
 def build_horizontal_column_map(df: pd.DataFrame) -> HorizontalColumnMap:
     cm = HorizontalColumnMap()
     cm.employee_first = _pick_col(df, ["First Name", "Employee First Name", "EE First Name", "First", "Given Name"])
     cm.employee_last = _pick_col(df, ["Last Name", "Employee Last Name", "EE Last Name", "Last", "Surname", "Family Name"])
-    cm.employee_id = _pick_col(df, ["Employee ID", "Employee Number", "Employee #", "EE #", "Worker ID", "Person Number"], allow_contains=False, allow_fuzzy=False)
-    cm.employee_dob = _pick_col(df, ["BIRTH DATE", "DOB", "Employee DOB", "Employee Date of Birth", "Date of Birth", "Birthdate"])
+    cm.employee_name = _pick_col(df, ["Employee Name", "EE Name", "Subscriber Name", "Member Name", "Full Name"], allow_fuzzy=False)
+    cm.employee_id = _pick_col(df, ["Employee ID", "Employee Code", "Employee Number", "Employee #", "EE #", "Worker ID", "Person Number"], allow_contains=False, allow_fuzzy=False)
+    cm.employee_dob = _pick_col(df, ["BIRTH DATE", "DOB", "Employee DOB", "Employee Date of Birth", "Date of Birth", "Birthdate", "Birth Date (MM/DD/YYYY)"])
     cm.employee_gender = _pick_col(df, ["Gender", "Sex"])
     cm.employee_email = _pick_col(df, ["Email", "Email Address", "Work Email", "Personal Email"])
     cm.address1 = _pick_col(df, ["PRIMARY ADDRESS LINE 1", "Address Line 1", "Street Address", "Home Address Line 1"])
     cm.address2 = _pick_col(df, ["PRIMARY ADDRESS LINE 2", "Address Line 2", "Home Address Line 2"])
     cm.city = _pick_col(df, ["PRIMARY ADDRESS - CITY", "Primary Address City", "City", "Home City"])
     cm.state = _pick_col(df, ["PRIMARY ADDRESS - STATE / TERRITORY", "Primary Address State", "State", "Home State"])
-    cm.zip_code = _pick_col(df, ["PRIMARY ADDRESS - ZIP CODE", "Primary Address Zip Code", "Zip Code", "Zip", "Home Zip"])
+    cm.zip_code = _pick_col(df, ["PRIMARY ADDRESS - ZIP CODE", "Primary Address Zip Code", "Primary Zip/Postal Code", "Primary Zip Postal Code", "Zip Code", "Zip", "Home Zip"])
     cm.county = _pick_col(df, ["County", "Home County", "Primary Address County"])
     cm.worksite_zip = _pick_col(df, ["WORKSITE ZIP CODE", "Primary Worksite Zip Code", "Worksite Zip", "Work Zip", "Work Location Zip"])
     cm.worksite_county = _pick_col(df, ["Primary Worksite County", "Worksite County", "Work County", "Work Location County"])
     cm.ichra_class = _pick_col(df, ["ICHRA Class", "Benefit Class", "Employee Class", "Class"])
     cm.worker_category = _pick_col(df, ["WORKER CATEGORY", "Worker Category", "Employee Type", "Employment Type"])
     cm.position_status = _pick_col(df, ["POSITION STATUS", "Employment Status", "Status"])
-    cm.health_election = _pick_col(df, ["Health Election", "Medical", "Medical Coverage", "Medical Coverage Code", "Medical Election", "Medical Coverage Election", "Coverage Election"], health_only=True)
+
+    # Keep explicit election columns separate from coverage-tier columns. A
+    # generic "Medical Coverage" header usually contains Employee Only / Family,
+    # not Enroll / Waive.
+    cm.health_election_cols = _pick_cols(
+        df,
+        ["Health Election", "Medical Election", "Medical Coverage Election", "Coverage Election", "Medical Coverage Code", "Medical"],
+        health_only=True,
+        allow_contains=False,
+        allow_fuzzy=False,
+    )
+    cm.health_election = cm.health_election_cols[0] if cm.health_election_cols else None
     cm.health_waive_reason = _pick_col(df, ["MEDICAL WAIVE REASON", "Health Waive Reason", "Waive Reason"], health_only=True)
     cm.plan_vendor = _pick_col(df, ["Current Health Plan Vendor", "Health Carrier", "Medical Carrier", "Carrier", "Medical Vendor"], health_only=True)
-    cm.plan_name = _pick_col(df, ["Product Name", "Current Plan Name", "Current Product Name", "Medical Product Name", "Health Product Name"], health_only=True, allow_fuzzy=False) or _pick_col(df, ["MEDICAL PLAN NAME", "Medical Plan Name", "Health Plan Name", "Current Health Plan", "Plan Name"], health_only=True)
-    cm.plan_tier = _pick_col(df, ["Current Health Plan Tier", "Medical Plan Tier", "Medical Coverage Tier", "Coverage Tier", "Coverage Level", "Benefit Tier", "Election Tier"], health_only=True)
+
+    cm.plan_name_cols = _pick_cols(
+        df,
+        ["Product Name", "Current Plan Name", "Current Product Name", "Medical Product Name", "Health Product Name", "Medical Plan", "Medical Plan Name", "Health Plan Name", "Current Health Plan", "Plan Name"],
+        health_only=True,
+        allow_fuzzy=False,
+    )
+    cm.plan_name = cm.plan_name_cols[0] if cm.plan_name_cols else None
+
+    cm.plan_tier_cols = _pick_cols(
+        df,
+        ["Current Health Plan Tier", "Medical Plan Tier", "Medical Plan Coverage", "Medical Coverage", "Medical Coverage Tier", "Coverage Tier", "Coverage Level", "Benefit Tier", "Election Tier"],
+        health_only=True,
+        allow_fuzzy=False,
+    )
+    cm.plan_tier = cm.plan_tier_cols[0] if cm.plan_tier_cols else None
+
     cm.oop_single = _pick_col(df, ["Current Health Plan OOP (single)", "Medical OOP Single", "OOP Single"], health_only=True)
     cm.oop_family = _pick_col(df, ["Current Health Plan OOP (family)", "Medical OOP Family", "OOP Family"], health_only=True)
     cm.ded_single = _pick_col(df, ["Current Health Plan Deductible (single)", "Medical Deductible Single", "Deductible Single"], health_only=True)
     cm.ded_family = _pick_col(df, ["Current Health Plan Deductible (family)", "Medical Deductible Family", "Deductible Family"], health_only=True)
     cm.er_cost = _pick_col(df, ["Current Health Plan ER Cost", "Medical ER Cost", "Employer Cost", "Pending Employer Cost", "Employer Contribution"], health_only=True, allow_fuzzy=False)
     cm.ee_cost = _pick_col(df, ["Current Health Plan EE Cost", "Medical EE Cost", "Employee Cost", "Pending Employee Cost", "Employee Contribution"], health_only=True, allow_fuzzy=False)
-    cm.annual_salary = _pick_col(df, ["ANNUAL SALARY", "Annual Salary", "Salary", "Base Salary"])
+    cm.annual_salary = _pick_col(df, ["ANNUAL SALARY", "Annual Salary", "Salary", "Base Salary", "Annual Base Salary"])
     cm.hourly_rate = _pick_col(df, ["Hourly Rate", "Hourly Wage"])
     cm.hours_per_week = _pick_col(df, ["Hours Per Week", "Weekly Hours", "Weekly Hours Worked"])
     cm.notes = _pick_col(df, ["Notes", "Comments", "Remarks"])
@@ -1179,14 +1258,83 @@ def build_horizontal_column_map(df: pd.DataFrame) -> HorizontalColumnMap:
 
 
 def find_dependent_slots(df: pd.DataFrame) -> tuple[list[DepSlot], bool]:
+    headers = [str(header) for header in df.columns]
+
+    # Handle repeated generic dependent blocks first. Employer exports often
+    # repeat the same six-column set and pandas dedupes the headers as .1, .2,
+    # etc. The previous logic saw the first unnumbered Dep DOB and incorrectly
+    # treated the file as row-wise, which discarded every later dependent slot.
+    repeated_field_names = {
+        "dependent name": "name_col",
+        "dependant name": "name_col",
+        "dep name": "name_col",
+        "dependent first name": "first_col",
+        "dep first name": "first_col",
+        "dependent last name": "last_col",
+        "dep last name": "last_col",
+        "dep gender": "gender_col",
+        "dependent gender": "gender_col",
+        "dep dob": "dob_col",
+        "dependent dob": "dob_col",
+        "dependent date of birth": "dob_col",
+        "relationship": "relationship_col",
+        "dependent relationship": "relationship_col",
+        "dep relationship": "relationship_col",
+        "on cobra": "cobra_col",
+        "dep covered on medical": "covered_col",
+        "dependent covered on medical": "covered_col",
+        "covered on medical": "covered_col",
+    }
+    anchor_headers = [
+        header for header in headers
+        if _base_header_norm(header) in {"dependent name", "dependant name", "dep name", "dep dob", "dependent dob", "dependent date of birth"}
+    ]
+    repeated_block_mode = len({_duplicate_header_number(header) for header in anchor_headers}) > 1
+
+    if repeated_block_mode:
+        slots: dict[int, DepSlot] = {}
+        anchor_numbers = {_duplicate_header_number(header) for header in anchor_headers}
+        for number in sorted(anchor_numbers):
+            slots[number] = DepSlot(slot=f"repeated_{number + 1}", number=number + 1)
+
+        for header in headers:
+            base = _base_header_norm(header)
+            attr = repeated_field_names.get(base)
+            number = _duplicate_header_number(header)
+            if not attr or number not in slots:
+                continue
+            setattr(slots[number], attr, header)
+
+        result = [
+            slot for slot in slots.values()
+            if slot.name_col or slot.first_col or slot.last_col or slot.dob_col or slot.relationship_col
+        ]
+        result.sort(key=lambda slot: slot.number)
+        return result, False
+
+    # True row-wise files have one set of dependent columns and repeat the
+    # employee across multiple rows. Only use row-wise mode after ruling out
+    # repeated generic blocks.
     row_rel = _pick_col(df, ["Dependent Relationship", "Dependent Relation", "Dependent Type", "Dep Relationship", "Dep Type"], dependent_only=True, allow_fuzzy=False)
     row_dob = _pick_col(df, ["Dependent DOB", "Dependent Date of Birth", "Dependent Birth Date", "Dep DOB", "Dep Birth Date"], dependent_only=True, allow_fuzzy=False)
     row_first = _pick_col(df, ["Dependent First Name", "Dep First Name", "Dependent First"], dependent_only=True, allow_fuzzy=False)
     row_last = _pick_col(df, ["Dependent Last Name", "Dep Last Name", "Dependent Last"], dependent_only=True, allow_fuzzy=False)
-    if row_rel or row_dob or row_first or row_last:
-        return [DepSlot("rowwise", relationship_col=row_rel, dob_col=row_dob, first_col=row_first, last_col=row_last, number=1)], True
+    row_name = _pick_col(df, ["Dependent Name", "Dep Name"], dependent_only=True, allow_fuzzy=False)
+    row_covered = _pick_col(df, ["Dependent Covered on Medical", "Dep Covered on Medical", "Covered on Medical"], dependent_only=True, allow_fuzzy=False)
+    if row_rel or row_dob or row_first or row_last or row_name:
+        return [
+            DepSlot(
+                "rowwise",
+                relationship_col=row_rel,
+                dob_col=row_dob,
+                first_col=row_first,
+                last_col=row_last,
+                name_col=row_name,
+                covered_col=row_covered,
+                number=1,
+            )
+        ], True
 
-    headers = list(df.columns)
     header_positions = {header: idx for idx, header in enumerate(headers)}
     slots: dict[str, DepSlot] = {}
 
@@ -1211,44 +1359,43 @@ def find_dependent_slots(df: pd.DataFrame) -> tuple[list[DepSlot], bool]:
             slot = get_slot(f"spouse_{slot_number}", 100 + slot_number, "Spouse")
         else:
             is_child_header = bool(re.search(r"\b(child|children|ch)\b", hn))
-            default_rel = "Child" if is_child_header else ""
+            is_numbered_dependent_header = bool(re.search(r"\b(dependent|dependant|dep)\b", hn) and number != 999)
+            default_rel = "Child" if (is_child_header or is_numbered_dependent_header) else ""
             slot = get_slot(f"dep_{number}", 200 + number, default_rel)
 
-        if any(x in hn for x in ["dob", "date of birth", "birth date", "birthdate", "birth"]):
+        if any(token in hn for token in ["dob", "date of birth", "birth date", "birthdate", "birth"]):
             slot.dob_col = header
         elif "first" in hn and "name" in hn:
             slot.first_col = header
         elif "last" in hn and "name" in hn:
             slot.last_col = header
-        elif any(x in hn for x in ["relationship", "relation", "type"]):
+        elif "name" in hn:
+            slot.name_col = header
+        elif any(token in hn for token in ["relationship", "relation", "type"]):
             slot.relationship_col = header
 
-    # Many employer templates have a generic "Name" column immediately before
-    # each dependent DOB column, for example: Name, SPOUSE DOB, SPOUSE GENDER,
-    # Name, CH #1 DOB. Since duplicate headers are deduped as Name.1, Name.2,
-    # attach those generic name columns to the nearest dependent slot on their
-    # right.
-    generic_name_headers = [
-        header for header in headers
-        if re.fullmatch(r"name( \d+)?", _norm(header))
-    ]
+    generic_name_headers = [header for header in headers if re.fullmatch(r"name( \d+)?", _norm(header))]
     for slot in slots.values():
-        if slot.first_col:
+        if slot.name_col or slot.first_col:
             continue
         anchor_col = slot.dob_col or slot.relationship_col or slot.last_col
         if not anchor_col or anchor_col not in header_positions:
             continue
         anchor_idx = header_positions[anchor_col]
-        candidate_headers = [
+        candidates = [
             header for header in generic_name_headers
             if header_positions[header] < anchor_idx and anchor_idx - header_positions[header] <= 2
         ]
-        if candidate_headers:
-            slot.first_col = sorted(candidate_headers, key=lambda h: anchor_idx - header_positions[h])[0]
+        if candidates:
+            slot.name_col = sorted(candidates, key=lambda header: anchor_idx - header_positions[header])[0]
 
-    result = [slot for slot in slots.values() if slot.relationship_col or slot.dob_col or slot.first_col or slot.last_col]
-    result.sort(key=lambda s: (0 if s.default_relationship == "Spouse" else 1, s.number, s.slot))
+    result = [
+        slot for slot in slots.values()
+        if slot.relationship_col or slot.dob_col or slot.first_col or slot.last_col or slot.name_col
+    ]
+    result.sort(key=lambda slot: (0 if slot.default_relationship == "Spouse" else 1, slot.number, slot.slot))
     return result, False
+
 
 def detect_horizontal_census(df: pd.DataFrame) -> tuple[bool, str]:
     headers = list(df.columns)
@@ -1269,13 +1416,29 @@ def _cell(row: pd.Series, col: Optional[str]) -> str:
     return str(row[col] or "").strip()
 
 
-def _first_nonblank(rows: pd.DataFrame, col: Optional[str]) -> str:
-    if not col or col not in rows.columns:
-        return ""
-    for value in rows[col].tolist():
-        if str(value).strip():
-            return str(value).strip()
+def _first_nonblank(rows: pd.DataFrame, col: Optional[str] | list[str]) -> str:
+    columns = col if isinstance(col, list) else ([col] if col else [])
+    for _, row in rows.iterrows():
+        for column in columns:
+            if column in rows.columns:
+                value = str(row[column] or "").strip()
+                if value:
+                    return value
     return ""
+
+
+def _split_combined_name(value: object) -> tuple[str, str]:
+    """Split common employer-export full-name formats into first/last names."""
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    if not text:
+        return "", ""
+    if "," in text:
+        last, given = text.split(",", 1)
+        return given.strip(), last.strip()
+    parts = text.split()
+    if len(parts) == 1:
+        return parts[0], ""
+    return " ".join(parts[:-1]), parts[-1]
 
 
 def _derive_ichra_class(row: pd.Series, cm: HorizontalColumnMap) -> str:
@@ -1394,8 +1557,12 @@ def convert_horizontal_to_vertical(df: pd.DataFrame, options: HorizontalOptions)
                 dob = _cell(src, slot.dob_col)
                 first = _cell(src, slot.first_col)
                 last = _cell(src, slot.last_col)
+                combined_name = _cell(src, slot.name_col)
+                if combined_name and not (first or last):
+                    first, last = _split_combined_name(combined_name)
+                covered = _cell(src, slot.covered_col)
                 dep_num = _cell(src, dep_num_col) or str(len(dependents) + 1)
-                if not any([rel_raw, dob, first, last]):
+                if not any([rel_raw, dob, first, last, combined_name]):
                     continue
                 rel_parts = [x.strip() for x in re.split(r"\s*[|;/]\s*", rel_raw) if x.strip()] or [rel_raw]
                 dob_parts = [x.strip() for x in re.split(r"\s*[|;]\s*", dob) if x.strip()] or [dob]
@@ -1421,6 +1588,7 @@ def convert_horizontal_to_vertical(df: pd.DataFrame, options: HorizontalOptions)
                         "Last Name": last_piece,
                         "_dep_number": f"{dep_num}.{part_i + 1}" if part_count > 1 else dep_num,
                         "_source_row": str(idx + 2),
+                        "_covered_on_medical": covered,
                     })
         else:
             for slot in dep_slots:
@@ -1428,7 +1596,11 @@ def convert_horizontal_to_vertical(df: pd.DataFrame, options: HorizontalOptions)
                 dob = _cell(first_row, slot.dob_col)
                 first = _cell(first_row, slot.first_col)
                 last = _cell(first_row, slot.last_col)
-                if not any([explicit_rel_raw, dob, first, last]):
+                combined_name = _cell(first_row, slot.name_col)
+                if combined_name and not (first or last):
+                    first, last = _split_combined_name(combined_name)
+                covered = _cell(first_row, slot.covered_col)
+                if not any([explicit_rel_raw, dob, first, last, combined_name]):
                     continue
                 rel_raw = explicit_rel_raw or slot.default_relationship
                 relationship, note = normalize_relationship(rel_raw)
@@ -1443,21 +1615,33 @@ def convert_horizontal_to_vertical(df: pd.DataFrame, options: HorizontalOptions)
                     "Last Name": last,
                     "_dep_number": str(slot.number),
                     "_source_row": str(idxs[0] + 2),
+                    "_covered_on_medical": covered,
                 })
 
         dependents = _sort_dependents(dependents)
 
-        raw_election = _first_nonblank(rows, cm.health_election)
+        raw_election = _first_nonblank(rows, cm.health_election_cols or cm.health_election)
         raw_waive_reason = _first_nonblank(rows, cm.health_waive_reason)
-        raw_plan_name = _first_nonblank(rows, cm.plan_name)
-        raw_tier = _first_nonblank(rows, cm.plan_tier)
+        raw_plan_name = _first_nonblank(rows, cm.plan_name_cols or cm.plan_name)
+        raw_tier = _first_nonblank(rows, cm.plan_tier_cols or cm.plan_tier)
         tier, tier_note = normalize_tier(raw_tier)
+        if tier not in VALID_HEALTH_PLAN_TIERS_WITH_WAIVE:
+            possible_election, possible_election_note = normalize_election(raw_tier)
+            if possible_election in {"Enroll", "Waive"} and not raw_election:
+                raw_election = raw_tier
+                if possible_election_note:
+                    notes.append({"Kind": "Auto-fix", "Issue": possible_election_note})
+            tier = ""
+            tier_note = None
         if not tier:
             tier, tier_note = derive_tier_from_coverage_code(raw_election)
         if tier_note:
             notes.append({"Kind": "Auto-fix", "Issue": tier_note})
 
         employee_election, election_note = normalize_election(raw_election)
+        if employee_election not in {"Enroll", "Waive"}:
+            employee_election = ""
+            election_note = None
         if election_note:
             notes.append({"Kind": "Auto-fix", "Issue": election_note})
         if not employee_election:
@@ -1480,6 +1664,9 @@ def convert_horizontal_to_vertical(df: pd.DataFrame, options: HorizontalOptions)
         employee = base_row()
         employee["First Name"] = _first_nonblank(rows, cm.employee_first)
         employee["Last Name"] = _first_nonblank(rows, cm.employee_last)
+        combined_employee_name = _first_nonblank(rows, cm.employee_name)
+        if combined_employee_name and not (employee["First Name"] or employee["Last Name"]):
+            employee["First Name"], employee["Last Name"] = _split_combined_name(combined_employee_name)
         apply_placeholder(employee, "Employee")
         employee["Employee ID"] = _first_nonblank(rows, cm.employee_id)
         employee["Relationship"] = "Employee"
@@ -1537,7 +1724,11 @@ def convert_horizontal_to_vertical(df: pd.DataFrame, options: HorizontalOptions)
                 dep_row["Primary Worksite Zip Code"] = employee["Primary Worksite Zip Code"]
                 dep_row["Primary Worksite County"] = employee["Primary Worksite County"]
             dep_row["ICHRA Class"] = employee["ICHRA Class"]
-            dep_row["Health Election"] = dependent_election_from_tier(employee_election, tier, dep_row["Relationship"])
+            explicit_dep_election, _ = normalize_election(dep.get("_covered_on_medical", ""))
+            if explicit_dep_election in {"Enroll", "Waive"}:
+                dep_row["Health Election"] = explicit_dep_election
+            else:
+                dep_row["Health Election"] = dependent_election_from_tier(employee_election, tier, dep_row["Relationship"])
             output_rows.append(dep_row)
             if not dep_row["Relationship"]:
                 notes.append({"Kind": "Warning", "Issue": f"Input row {dep.get('_source_row', '?')}: dependent has no relationship."})
