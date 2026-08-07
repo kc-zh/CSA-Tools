@@ -926,6 +926,113 @@ def _read_csv_with_fallback_encoding(file_obj) -> tuple[pd.DataFrame, str]:
         raise last_exc if last_exc else RuntimeError("Unable to decode uploaded file")
 
 
+def _score_excel_worksheet(raw: pd.DataFrame, sheet_name: str) -> dict[str, Any]:
+    """Score one worksheet for how likely it is to contain row-level census data.
+
+    Content is intentionally weighted much more heavily than the worksheet name.
+    This keeps tabs such as "Summary", "Instructions", or "Report Criteria" from
+    being selected simply because of their position in the workbook, while still
+    allowing unfamiliar census-tab names to win when their headers match.
+    """
+    raw = raw.fillna("").astype(str)
+    nonblank_mask = raw.apply(lambda row: any(str(value).strip() for value in row), axis=1)
+    if not nonblank_mask.any():
+        return {
+            "sheet_name": sheet_name,
+            "score": 0,
+            "header_score": 0,
+            "header_row": None,
+            "data_rows": 0,
+            "recognized_fields": [],
+        }
+
+    first_nonblank = int(nonblank_mask[nonblank_mask].index[0])
+    last_nonblank = int(nonblank_mask[nonblank_mask].index[-1])
+    trimmed = raw.iloc[first_nonblank:last_nonblank + 1].reset_index(drop=True)
+
+    max_scan = min(len(trimmed), 40)
+    row_scores = [(idx, _score_header_row(trimmed.iloc[idx].tolist())) for idx in range(max_scan)]
+    best_idx, best_header_score = max(row_scores, key=lambda item: item[1])
+
+    header_values = trimmed.iloc[best_idx].tolist()
+    recognized_fields = sorted({
+        canonical
+        for canonical in (canonical_from_header(value) for value in header_values)
+        if canonical
+    })
+    dependent_header_count = sum(1 for value in header_values if _is_actual_dependent_header(value))
+
+    identity_fields = {"First Name", "Last Name", "DOB", "Relationship"}
+    location_fields = {"Zip Code", "Primary Worksite Zip Code"}
+    health_fields = {"Health Election", "Current Health Plan", "Current Health Plan Tier"}
+
+    structure_bonus = 0
+    structure_bonus += 6 * len(identity_fields.intersection(recognized_fields))
+    structure_bonus += 3 * len(location_fields.intersection(recognized_fields))
+    structure_bonus += 2 * len(health_fields.intersection(recognized_fields))
+    structure_bonus += min(dependent_header_count, 8) * 2
+
+    data_rows = max(len(trimmed) - best_idx - 1, 0)
+    data_bonus = min(data_rows, 100)
+
+    # Worksheet-name hints are only tie-breakers. Census content drives selection.
+    name_norm = _norm(sheet_name)
+    name_bonus = 0
+    if any(term in name_norm for term in ["census", "roster", "eligibility", "employee", "member", "detail"]):
+        name_bonus += 5
+    if any(term in name_norm for term in ["summary", "criteria", "instruction", "cover", "legend"]):
+        name_bonus -= 5
+
+    total_score = (best_header_score * 100) + (structure_bonus * 10) + data_bonus + name_bonus
+
+    return {
+        "sheet_name": sheet_name,
+        "score": int(total_score),
+        "header_score": int(best_header_score),
+        "header_row": int(best_idx + first_nonblank),
+        "data_rows": int(data_rows),
+        "recognized_fields": recognized_fields,
+    }
+
+
+def _select_census_worksheet(workbook_sheets: dict[str, pd.DataFrame]) -> tuple[str, pd.DataFrame, list[dict[str, Any]]]:
+    """Choose the worksheet that most likely contains the actual census."""
+    if not workbook_sheets:
+        raise ValueError("The Excel workbook does not contain any readable worksheets.")
+
+    candidates = [
+        _score_excel_worksheet(raw, sheet_name)
+        for sheet_name, raw in workbook_sheets.items()
+    ]
+    candidates.sort(
+        key=lambda item: (
+            item["score"],
+            item["header_score"],
+            item["data_rows"],
+        ),
+        reverse=True,
+    )
+
+    best = candidates[0]
+
+    # Preserve legacy behavior for ordinary one-sheet workbooks even when their
+    # headers are unusual. Multi-sheet workbooks require a minimum amount of
+    # census evidence so we do not silently validate a summary/instruction tab.
+    if len(candidates) > 1 and best["header_score"] < 5:
+        reviewed = ", ".join(
+            f"{candidate['sheet_name']} (header score {candidate['header_score']})"
+            for candidate in candidates
+        )
+        raise ValueError(
+            "Could not confidently identify the census worksheet in this workbook. "
+            f"Reviewed sheets: {reviewed}. Please ensure the census tab contains recognizable "
+            "employee/member headers such as name, relationship, DOB, ZIP, or dependent fields."
+        )
+
+    selected_name = str(best["sheet_name"])
+    return selected_name, workbook_sheets[selected_name], candidates
+
+
 def _read_excel_with_fallback(uploaded) -> pd.DataFrame:
     raw_bytes = uploaded.read()
     if isinstance(raw_bytes, str):
@@ -935,15 +1042,33 @@ def _read_excel_with_fallback(uploaded) -> pd.DataFrame:
     for engine in [None, "openpyxl", "xlrd"]:
         try:
             bio = io.BytesIO(raw_bytes)
-            kwargs = {"dtype": str, "keep_default_na": False, "header": None}
+            kwargs = {
+                "dtype": str,
+                "keep_default_na": False,
+                "header": None,
+                "sheet_name": None,
+            }
             if engine is not None:
                 kwargs["engine"] = engine
-            raw = pd.read_excel(bio, **kwargs)
-            return _finalize_raw_dataframe(raw)
+
+            workbook_sheets = pd.read_excel(bio, **kwargs)
+            if isinstance(workbook_sheets, pd.DataFrame):
+                workbook_sheets = {"Sheet1": workbook_sheets}
+
+            selected_sheet, raw, candidates = _select_census_worksheet(workbook_sheets)
+            df = _finalize_raw_dataframe(raw)
+            df.attrs["selected_sheet"] = selected_sheet
+            df.attrs["sheet_detection"] = candidates
+            df.attrs["workbook_sheet_count"] = len(workbook_sheets)
+            return df
         except ImportError as exc:
             last_exc = exc
             continue
         except ValueError as exc:
+            # A content-selection error is meaningful and should not be hidden by
+            # retrying another Excel engine when the workbook was already readable.
+            if "Could not confidently identify the census worksheet" in str(exc):
+                raise
             last_exc = exc
             continue
         except Exception as exc:
@@ -959,7 +1084,6 @@ def _read_excel_with_fallback(uploaded) -> pd.DataFrame:
             "and upload that file."
         ) from last_exc
     raise ValueError(f"Could not read the uploaded Excel file: {last_exc}") from last_exc
-
 
 def read_uploaded_file(uploaded) -> pd.DataFrame:
     name = uploaded.name.lower()
@@ -2324,6 +2448,10 @@ def _style_issues(issue_rows: list[dict[str, Any]]) -> "pd.io.formats.style.Styl
 
 
 def _build_results(df_input: pd.DataFrame, input_mode: str, use_zip_lookup: bool, horizontal_options: HorizontalOptions) -> dict[str, Any]:
+    selected_sheet = df_input.attrs.get("selected_sheet")
+    sheet_detection = df_input.attrs.get("sheet_detection", [])
+    workbook_sheet_count = df_input.attrs.get("workbook_sheet_count")
+
     zip_cache = build_zip_cache() if (use_zip_lookup and ZIPCODES_AVAILABLE) else {}
     horizontal_detected, detect_reason = detect_horizontal_census(df_input)
     force_horizontal = input_mode == "Horizontal dependent census"
@@ -2350,6 +2478,9 @@ def _build_results(df_input: pd.DataFrame, input_mode: str, use_zip_lookup: bool
     results["detect_reason"] = detect_reason
     results["horizontal_notes"] = horizontal_notes
     results["conversion_summary"] = conversion_summary
+    results["selected_sheet"] = selected_sheet
+    results["sheet_detection"] = sheet_detection
+    results["workbook_sheet_count"] = workbook_sheet_count
     return results
 
 
@@ -2453,6 +2584,26 @@ def main() -> None:
     valid_rows = total - error_rows
 
     st.divider()
+    if results.get("selected_sheet"):
+        sheet_count = results.get("workbook_sheet_count") or 1
+        if sheet_count > 1:
+            st.info(
+                f"Workbook sheet detection: selected '{results['selected_sheet']}' "
+                f"from {sheet_count} worksheets as the census tab."
+            )
+            with st.expander("Workbook sheet detection details", expanded=False):
+                for candidate in results.get("sheet_detection", []):
+                    marker = "Selected" if candidate.get("sheet_name") == results.get("selected_sheet") else "Skipped"
+                    recognized = ", ".join(candidate.get("recognized_fields", [])) or "none"
+                    header_row = candidate.get("header_row")
+                    header_display = int(header_row) + 1 if header_row is not None else "n/a"
+                    st.caption(
+                        f"{marker}: {candidate.get('sheet_name')} | "
+                        f"header score {candidate.get('header_score', 0)} | "
+                        f"detected header row {header_display} | "
+                        f"recognized fields: {recognized}"
+                    )
+
     if results.get("horizontal_used"):
         conversion = results.get("conversion_summary") or {}
         st.markdown(
