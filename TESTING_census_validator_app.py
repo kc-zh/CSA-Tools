@@ -2672,15 +2672,27 @@ def main() -> None:
         with tabs[0]:
             st.dataframe(_style_issues(all_issues), use_container_width=True, hide_index=True)
         with tabs[1]:
-            st.dataframe(_style_issues(errors), use_container_width=True, hide_index=True) if errors else st.success("No errors found.")
+            if errors:
+                st.dataframe(_style_issues(errors), use_container_width=True, hide_index=True)
+            else:
+                st.success("No errors found.")
         with tabs[2]:
             warning_rows = warnings + [row for row in horizontal_issue_rows if row["Kind"] == "Warning"]
-            st.dataframe(_style_issues(warning_rows), use_container_width=True, hide_index=True) if warning_rows else st.success("No warnings found.")
+            if warning_rows:
+                st.dataframe(_style_issues(warning_rows), use_container_width=True, hide_index=True)
+            else:
+                st.success("No warnings found.")
         with tabs[3]:
             fix_rows = fixes + [row for row in horizontal_issue_rows if row["Kind"] == "Auto-fix"]
-            st.dataframe(_style_issues(fix_rows), use_container_width=True, hide_index=True) if fix_rows else st.info("No auto-fixes applied.")
+            if fix_rows:
+                st.dataframe(_style_issues(fix_rows), use_container_width=True, hide_index=True)
+            else:
+                st.info("No auto-fixes applied.")
         with tabs[4]:
-            st.dataframe(_style_issues(clears), use_container_width=True, hide_index=True) if clears else st.info("No fields were cleared.")
+            if clears:
+                st.dataframe(_style_issues(clears), use_container_width=True, hide_index=True)
+            else:
+                st.info("No fields were cleared.")
 
     st.divider()
     with st.expander("Preview reformatted output", expanded=False):
