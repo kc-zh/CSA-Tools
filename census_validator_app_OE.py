@@ -2389,7 +2389,7 @@ def calculate_zizzl_fee(enrolled_count: int, aor_count: int) -> dict[str, Any]:
     if enrolled_count < 0 or not 0 <= aor_count <= enrolled_count:
         raise ValueError("Counts must satisfy 0 <= AOR count <= enrolled count.")
     other_count = enrolled_count - aor_count
-    if enrolled_count < 10:
+    if enrolled_count < 9:
         return {
             "label": "$250 Flat Admin Fee", "monthly_fee": Decimal("250"),
             "peepm": None, "aor_rate": None, "standard_rate": None,
@@ -2530,10 +2530,10 @@ def render_enrollment_fee_summary(census: pd.DataFrame) -> None:
                     f"÷ {summary['enrolled_count']} ≈ ${fee['peepm']:.2f} PEEPM"
                 )
                 st.caption("The total enrolled count determines the pricing tier. The blended rate is rounded to the nearest $0.50 after calculation; halfway values round up.")
-            elif summary["enrolled_count"] >= 10:
-                st.text("10–49 enrolled employees: $28 PEEPM in all states.")
+            elif summary["enrolled_count"] >= 9:
+                st.text("9–49 enrolled employees: $28 PEEPM in all states.")
             else:
-                st.text("0–9 enrolled employees: $250 flat monthly admin fee.")
+                st.text("0–8 enrolled employees: $250 flat monthly admin fee.")
             st.caption("AOR discounts and Free ACA begin at 50 enrolled employees. Counts use the full reformatted census, including employees with validation errors.")
 
         unmatched = summary["unmatched_employees"]
