@@ -2,7 +2,7 @@
 Census Validator & Reformatter - Streamlit App
 ==============================================
 Install:  pip install streamlit pandas zipcodes openpyxl rapidfuzz
-Run:      streamlit run census_validator_app_updated.py
+Run:      streamlit run census_validator_app_v4_fixed.py
 
 Purpose
 -------
@@ -15,11 +15,12 @@ headers with line breaks or parenthetical instructions.
 
 from __future__ import annotations
 
+from decimal import Decimal, ROUND_HALF_UP
+
 import csv
 import io
 import re
 from dataclasses import dataclass, field
-from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Optional
 
 import pandas as pd
@@ -2401,9 +2402,9 @@ def calculate_zizzl_fee(enrolled_count: int, aor_count: int) -> dict[str, Any]:
     )
     aor_rate = 13 if enrolled_count >= 50 else standard_rate
     monthly_fee = Decimal(aor_count * aor_rate + other_count * standard_rate)
-    peepm = (monthly_fee / Decimal(enrolled_count)).quantize(
-        Decimal("0.01"), rounding=ROUND_HALF_UP
-    )
+    peepm = (monthly_fee / (Decimal(enrolled_count) * Decimal("0.50"))).quantize(
+        Decimal("1"), rounding=ROUND_HALF_UP
+    ) * Decimal("0.50")
     display_rate = f"{peepm:.2f}" if peepm != peepm.to_integral_value() else f"{peepm:.0f}"
     return {
         "label": f"${display_rate} PEEPM", "monthly_fee": monthly_fee,
@@ -2420,80 +2421,136 @@ def build_enrollment_fee_summary(
     Home ZIP alone determines AOR eligibility. Unknown ZIPs receive no discount
     and remain in Other States, explicitly flagged for review by the UI.
     """
-    data = census.reindex(columns=["Relationship", "Health Election", "Zip Code"]).fillna("")
-    relationships = data["Relationship"].map(lambda v: normalize_relationship(v)[0])
-    elections = data["Health Election"].map(lambda v: normalize_election(v)[0])
-    enrolled = data.loc[relationships.eq("Employee") & elections.eq("Enroll")]
+    columns = ["First Name", "Last Name", "Relationship", "Health Election", "Zip Code"]
+    data = census.reindex(columns=columns).fillna("")
     counts = {abbr: 0 for abbr in AOR_STATES}
-    other_count = 0
-    unknown_count = 0
-    for value in enrolled["Zip Code"]:
-        home_zip = _pad_zip(value)
+    total = other_count = unknown_count = unresolved_count = 0
+    unmatched_employees = []
+
+    for position, row in enumerate(data.to_dict("records")):
+        relationship = normalize_relationship(row["Relationship"])[0]
+        election = normalize_election(row["Health Election"])[0]
+        if relationship not in {"Employee", "Spouse", "Child"}:
+            unresolved_count += 1
+        if relationship != "Employee":
+            continue
+        if election not in {"Enroll", "Waive"}:
+            unresolved_count += 1
+
+        home_zip = _pad_zip(row["Zip Code"])
         info = zip_cache.get(home_zip) if re.fullmatch(r"\d{5}", home_zip) else None
-        state = str((info or {}).get("abbr", "")).upper()
-        if state in AOR_STATES:
-            counts[state] += 1
-        else:
-            other_count += 1
-            if state not in SUPPORTED_ZIP_STATES:
-                unknown_count += 1
-    state_rows = [{"Home State": name, "Enrolled Employees": counts[abbr]}
-                  for abbr, name in AOR_STATES.items()]
+        state = str((info or {}).get("abbr", "")).strip().upper()
+        matched = state in SUPPORTED_ZIP_STATES
+        is_enrolled = election == "Enroll"
+
+        if not matched:
+            if not home_zip:
+                issue = "Missing home ZIP"
+            elif not re.fullmatch(r"\d{5}", home_zip):
+                issue = "Invalid U.S. ZIP format"
+            elif home_zip in KNOWN_INVALID_OR_UNSUPPORTED_ZIPS:
+                issue = "Unsupported home ZIP"
+            elif not zip_cache:
+                issue = "ZIP lookup unavailable"
+            else:
+                issue = "Home ZIP not matched to a supported state"
+            unmatched_employees.append({
+                "Reformatted CSV Row": position + 2,
+                "First Name": row["First Name"],
+                "Last Name": row["Last Name"],
+                "Home ZIP Code": str(row["Zip Code"]),
+                "Health Election": election or "Missing",
+                "Issue": issue,
+                "Included in Fee": "Yes" if is_enrolled else "No",
+            })
+
+        if is_enrolled:
+            total += 1
+            if state in AOR_STATES:
+                counts[state] += 1
+            else:
+                other_count += 1
+                unknown_count += int(not matched)
+
+    state_rows = [
+        {"Home State": name, "Enrolled Employees": counts[abbr]}
+        for abbr, name in AOR_STATES.items()
+    ]
     state_rows.append({"Home State": "Other States", "Enrolled Employees": other_count})
-    total = len(enrolled)
     aor_count = sum(counts.values())
-    # Unresolved relationships/elections may change the group-size tier.
-    unresolved = (
-        ~relationships.isin(["Employee", "Spouse", "Child"])
-        | (relationships.eq("Employee") & ~elections.isin(["Enroll", "Waive"]))
-    )
     return {
         "state_rows": state_rows, "enrolled_count": total, "aor_count": aor_count,
         "other_count": other_count, "unknown_zip_count": unknown_count,
-        "unresolved_count": int(unresolved.sum()),
+        "unresolved_count": unresolved_count,
+        "unmatched_employees": unmatched_employees,
+        "lookup_available": bool(zip_cache),
         "fee": calculate_zizzl_fee(total, aor_count),
     }
 
 
 def render_enrollment_fee_summary(census: pd.DataFrame) -> None:
-    # Pricing ZIP lookup is independent of the county auto-fill toggle.
-    summary = build_enrollment_fee_summary(census, build_zip_cache())
-    fee = summary["fee"]
-    st.subheader("Enrolled employees by home state")
-    st.caption("Employees marked Enroll only. Dependents and waived employees are excluded.")
-    columns = st.columns(3)
-    columns[0].metric("Total enrolled employees", summary["enrolled_count"])
-    columns[1].metric("AOR states", summary["aor_count"])
-    columns[2].metric("Other States", summary["other_count"])
-    st.dataframe(pd.DataFrame(summary["state_rows"]), use_container_width=True, hide_index=True)
+    """An isolated, opt-in panel; does not mutate census or validation results."""
+    with st.expander("Enrolled employee summary & zizzl pricing", expanded=False):
+        # Independent of county auto-fill; reuse the existing cached ZIP lookup.
+        summary = build_enrollment_fee_summary(census, build_zip_cache())
+        fee = summary["fee"]
+        st.caption("Based on enrolled employees and home ZIP codes. Dependents and waived employees are excluded from pricing.")
+        columns = st.columns(3)
+        columns[0].metric("Enrolled employees", summary["enrolled_count"])
+        columns[1].metric("AOR states", summary["aor_count"])
+        columns[2].metric("Other States", summary["other_count"])
+        st.dataframe(
+            pd.DataFrame(summary["state_rows"]),
+            use_container_width=True, hide_index=True, height=353,
+        )
 
-    st.markdown("#### zizzl fee / PEEPM")
-    st.markdown(f"### {fee['label']}" + (" + Free ACA" if fee["free_aca"] else ""))
-    if summary["enrolled_count"] >= 50:
-        st.caption(
-            f"[(${fee['aor_rate']} × {summary['aor_count']} AOR employees) + "
-            f"(${fee['standard_rate']} × {summary['other_count']} Other States employees)] "
-            f"÷ {summary['enrolled_count']} enrolled employees = ${fee['peepm']:.2f} PEEPM. "
-            "The blended rate is rounded to two decimal places after calculation."
-        )
-    elif summary["enrolled_count"] >= 10:
-        st.caption("10–49 enrolled employees: $28 PEEPM in all states. AOR discounts start at 50 enrolled employees.")
-    else:
-        st.caption("0–9 enrolled employees: $250 flat monthly admin fee.")
-    if not ZIPCODES_AVAILABLE:
-        st.warning("Home-state lookup is unavailable. Install zipcodes and rerun the app to apply AOR discounts. All enrolled employees are temporarily counted under Other States.")
-    if summary["unknown_zip_count"]:
-        st.warning(
-            f"Provisional fee: {summary['unknown_zip_count']} enrolled employee(s) have missing or "
-            "unrecognized home ZIP codes. They are included in Other States at the standard rate "
-            "(or flat fee for 0–9). Correct their home ZIP codes and validate again."
-        )
-    if summary["unresolved_count"]:
-        st.warning(
-            f"Provisional count: {summary['unresolved_count']} row(s) have unresolved relationships "
-            "or employee health elections. Resolve these fields and validate again to confirm the pricing tier."
-        )
-    st.caption("Based on the full reformatted census, including enrolled employee rows with validation errors. Free ACA applies to groups with 50+ enrolled employees.")
+        # Metrics and plain text prevent dollar signs from being parsed as math.
+        st.metric("zizzl fee / PEEPM", fee["label"])
+        if fee["free_aca"]:
+            st.success("Free ACA included")
+        if not summary["lookup_available"]:
+            st.warning("Home-state lookup is unavailable. Pricing is provisional until ZIP lookup is restored.")
+        if summary["unknown_zip_count"]:
+            st.warning(
+                f"{summary['unknown_zip_count']} enrolled employee(s) have unverified home ZIP codes. "
+                "They are included in Other States without an AOR discount. "
+                "Correct the ZIP codes and validate again to confirm pricing."
+            )
+        if summary["unresolved_count"]:
+            st.warning(
+                f"{summary['unresolved_count']} row(s) have unresolved relationships or employee elections. "
+                "Review the validation report to confirm the enrolled count and pricing tier."
+            )
+
+        if st.checkbox("Show fee calculation details", key="fee_show_calculation_details"):
+            if summary["enrolled_count"] >= 50:
+                st.text(
+                    f"({summary['aor_count']} AOR × $13 + "
+                    f"{summary['other_count']} Other States × ${fee['standard_rate']}) "
+                    f"÷ {summary['enrolled_count']} ≈ ${fee['peepm']:.2f} PEEPM"
+                )
+                st.caption("The total enrolled count determines the pricing tier. The blended rate is rounded to the nearest $0.50 after calculation; halfway values round up.")
+            elif summary["enrolled_count"] >= 10:
+                st.text("10–49 enrolled employees: $28 PEEPM in all states.")
+            else:
+                st.text("0–9 enrolled employees: $250 flat monthly admin fee.")
+            st.caption("AOR discounts and Free ACA begin at 50 enrolled employees. Counts use the full reformatted census, including employees with validation errors.")
+
+        unmatched = summary["unmatched_employees"]
+        if unmatched:
+            st.markdown(f"**Employees with unmatched home ZIP codes ({len(unmatched)})**")
+            st.caption("Includes enrolled and waived employees. Row numbers reference the full reformatted CSV, with the header as row 1.")
+            unmatched_df = pd.DataFrame(unmatched)
+            st.dataframe(
+                unmatched_df, use_container_width=True, hide_index=True,
+                height=min(388, 38 + 35 * len(unmatched_df)),
+            )
+            st.download_button(
+                "Download unmatched ZIP list", data=df_to_csv_bytes(unmatched_df),
+                file_name="employees_unmatched_home_zips.csv", mime="text/csv",
+                key="fee_unmatched_home_zip_download",
+                use_container_width=True,
+            )
 
 
 # =============================================================================
@@ -2758,9 +2815,6 @@ def main() -> None:
     metric_cols[7].metric("Mode", "Horizontal" if results.get("horizontal_used") else "Vertical")
 
     st.divider()
-    render_enrollment_fee_summary(reformatted_df)
-
-    st.divider()
     st.subheader("Downloads")
     download_cols = st.columns(4)
     with download_cols[0]:
@@ -2824,6 +2878,9 @@ def main() -> None:
     st.divider()
     with st.expander("Preview reformatted output", expanded=False):
         st.dataframe(reformatted_df, use_container_width=True, hide_index=True)
+
+
+    render_enrollment_fee_summary(reformatted_df)
 
 
 if __name__ == "__main__":
