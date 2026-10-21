@@ -2421,73 +2421,69 @@ def build_enrollment_fee_summary(
     Home ZIP alone determines AOR eligibility. Unknown ZIPs receive no discount
     and remain in Other States, explicitly flagged for review by the UI.
     """
-    data = census.reindex(columns=["First Name", "Last Name", "Relationship", "Health Election", "Zip Code"]).fillna("")
-    relationships = data["Relationship"].map(lambda v: normalize_relationship(v)[0])
-    elections = data["Health Election"].map(lambda v: normalize_election(v)[0])
-    enrolled = data.loc[relationships.eq("Employee") & elections.eq("Enroll")]
-    unmatched_employees = []
-    for position, (_, row) in enumerate(data.iterrows()):
-        if relationships.iloc[position] != "Employee":
-            continue
-        home_zip = _pad_zip(row["Zip Code"])
-        info = zip_cache.get(home_zip) if re.fullmatch(r"\d{5}", home_zip) else None
-        if str((info or {}).get("abbr", "")).upper() in SUPPORTED_ZIP_STATES:
-            continue
-        unmatched_employees.append({
-            "Reformatted CSV Row": position + 2,
-            "First Name": row["First Name"],
-            "Last Name": row["Last Name"],
-            "Home ZIP Code": str(row["Zip Code"]),
-            "Health Election": elections.iloc[position] or "Missing",
-            "Issue": "Missing home ZIP" if not home_zip else "Home ZIP not matched",
-            "Included in Fee": "Yes" if elections.iloc[position] == "Enroll" else "No",
-        })
-    unmatched_employees = []
-    for position, (_, row) in enumerate(data.iterrows()):
-        if relationships.iloc[position] != "Employee":
-            continue
-        home_zip = _pad_zip(row["Zip Code"])
-        info = zip_cache.get(home_zip) if re.fullmatch(r"\d{5}", home_zip) else None
-        if str((info or {}).get("abbr", "")).upper() in SUPPORTED_ZIP_STATES:
-            continue
-        unmatched_employees.append({
-            "Reformatted CSV Row": position + 2,
-            "First Name": row["First Name"],
-            "Last Name": row["Last Name"],
-            "Home ZIP Code": str(row["Zip Code"]),
-            "Health Election": elections.iloc[position] or "Missing",
-            "Issue": "Missing home ZIP" if not home_zip else "Home ZIP not matched",
-            "Included in Fee": "Yes" if elections.iloc[position] == "Enroll" else "No",
-        })
+    columns = ["First Name", "Last Name", "Relationship", "Health Election", "Zip Code"]
+    data = census.reindex(columns=columns).fillna("")
     counts = {abbr: 0 for abbr in AOR_STATES}
-    other_count = 0
-    unknown_count = 0
-    for value in enrolled["Zip Code"]:
-        home_zip = _pad_zip(value)
+    total = other_count = unknown_count = unresolved_count = 0
+    unmatched_employees = []
+
+    for position, row in enumerate(data.to_dict("records")):
+        relationship = normalize_relationship(row["Relationship"])[0]
+        election = normalize_election(row["Health Election"])[0]
+        if relationship not in {"Employee", "Spouse", "Child"}:
+            unresolved_count += 1
+        if relationship != "Employee":
+            continue
+        if election not in {"Enroll", "Waive"}:
+            unresolved_count += 1
+
+        home_zip = _pad_zip(row["Zip Code"])
         info = zip_cache.get(home_zip) if re.fullmatch(r"\d{5}", home_zip) else None
-        state = str((info or {}).get("abbr", "")).upper()
-        if state in AOR_STATES:
-            counts[state] += 1
-        else:
-            other_count += 1
-            if state not in SUPPORTED_ZIP_STATES:
-                unknown_count += 1
-    state_rows = [{"Home State": name, "Enrolled Employees": counts[abbr]}
-                  for abbr, name in AOR_STATES.items()]
+        state = str((info or {}).get("abbr", "")).strip().upper()
+        matched = state in SUPPORTED_ZIP_STATES
+        is_enrolled = election == "Enroll"
+
+        if not matched:
+            if not home_zip:
+                issue = "Missing home ZIP"
+            elif not re.fullmatch(r"\d{5}", home_zip):
+                issue = "Invalid U.S. ZIP format"
+            elif home_zip in KNOWN_INVALID_OR_UNSUPPORTED_ZIPS:
+                issue = "Unsupported home ZIP"
+            elif not zip_cache:
+                issue = "ZIP lookup unavailable"
+            else:
+                issue = "Home ZIP not matched to a supported state"
+            unmatched_employees.append({
+                "Reformatted CSV Row": position + 2,
+                "First Name": row["First Name"],
+                "Last Name": row["Last Name"],
+                "Home ZIP Code": str(row["Zip Code"]),
+                "Health Election": election or "Missing",
+                "Issue": issue,
+                "Included in Fee": "Yes" if is_enrolled else "No",
+            })
+
+        if is_enrolled:
+            total += 1
+            if state in AOR_STATES:
+                counts[state] += 1
+            else:
+                other_count += 1
+                unknown_count += int(not matched)
+
+    state_rows = [
+        {"Home State": name, "Enrolled Employees": counts[abbr]}
+        for abbr, name in AOR_STATES.items()
+    ]
     state_rows.append({"Home State": "Other States", "Enrolled Employees": other_count})
-    total = len(enrolled)
     aor_count = sum(counts.values())
-    # Unresolved relationships/elections may change the group-size tier.
-    unresolved = (
-        ~relationships.isin(["Employee", "Spouse", "Child"])
-        | (relationships.eq("Employee") & ~elections.isin(["Enroll", "Waive"]))
-    )
     return {
         "state_rows": state_rows, "enrolled_count": total, "aor_count": aor_count,
         "other_count": other_count, "unknown_zip_count": unknown_count,
-        "unresolved_count": int(unresolved.sum()),
+        "unresolved_count": unresolved_count,
         "unmatched_employees": unmatched_employees,
-        "unmatched_employees": unmatched_employees,
+        "lookup_available": bool(zip_cache),
         "fee": calculate_zizzl_fee(total, aor_count),
     }
 
@@ -2503,17 +2499,20 @@ def render_enrollment_fee_summary(census: pd.DataFrame) -> None:
         columns[0].metric("Enrolled employees", summary["enrolled_count"])
         columns[1].metric("AOR states", summary["aor_count"])
         columns[2].metric("Other States", summary["other_count"])
-        st.table(pd.DataFrame(summary["state_rows"]).set_index("Home State"))
+        st.dataframe(
+            pd.DataFrame(summary["state_rows"]),
+            use_container_width=True, hide_index=True, height=353,
+        )
 
         # Metrics and plain text prevent dollar signs from being parsed as math.
         st.metric("zizzl fee / PEEPM", fee["label"])
         if fee["free_aca"]:
             st.success("Free ACA included")
-        if not ZIPCODES_AVAILABLE:
-            st.warning("Home-state lookup is unavailable. Install zipcodes and restart the app. Pricing is provisional until ZIP lookup is available.")
+        if not summary["lookup_available"]:
+            st.warning("Home-state lookup is unavailable. Pricing is provisional until ZIP lookup is restored.")
         if summary["unknown_zip_count"]:
             st.warning(
-                f"{summary['unknown_zip_count']} enrolled employee(s) have unmatched home ZIP codes. "
+                f"{summary['unknown_zip_count']} enrolled employee(s) have unverified home ZIP codes. "
                 "They are included in Other States without an AOR discount. "
                 "Correct the ZIP codes and validate again to confirm pricing."
             )
@@ -2539,14 +2538,18 @@ def render_enrollment_fee_summary(census: pd.DataFrame) -> None:
 
         unmatched = summary["unmatched_employees"]
         if unmatched:
-            st.markdown("**Employees with unmatched home ZIP codes**")
+            st.markdown(f"**Employees with unmatched home ZIP codes ({len(unmatched)})**")
             st.caption("Includes enrolled and waived employees. Row numbers reference the full reformatted CSV, with the header as row 1.")
             unmatched_df = pd.DataFrame(unmatched)
-            st.dataframe(unmatched_df, use_container_width=True, hide_index=True)
+            st.dataframe(
+                unmatched_df, use_container_width=True, hide_index=True,
+                height=min(388, 38 + 35 * len(unmatched_df)),
+            )
             st.download_button(
                 "Download unmatched ZIP list", data=df_to_csv_bytes(unmatched_df),
                 file_name="employees_unmatched_home_zips.csv", mime="text/csv",
                 key="fee_unmatched_home_zip_download",
+                use_container_width=True,
             )
 
 
