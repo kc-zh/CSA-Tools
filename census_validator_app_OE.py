@@ -15,7 +15,7 @@ headers with line breaks or parenthetical instructions.
 
 from __future__ import annotations
 
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_CEILING
 
 import csv
 import io
@@ -2403,7 +2403,7 @@ def calculate_zizzl_fee(enrolled_count: int, aor_count: int) -> dict[str, Any]:
     aor_rate = 13 if enrolled_count >= 50 else standard_rate
     monthly_fee = Decimal(aor_count * aor_rate + other_count * standard_rate)
     peepm = (monthly_fee / (Decimal(enrolled_count) * Decimal("0.50"))).quantize(
-        Decimal("1"), rounding=ROUND_HALF_UP
+        Decimal("1"), rounding=ROUND_CEILING
     ) * Decimal("0.50")
     display_rate = f"{peepm:.2f}" if peepm != peepm.to_integral_value() else f"{peepm:.0f}"
     return {
@@ -2529,7 +2529,7 @@ def render_enrollment_fee_summary(census: pd.DataFrame) -> None:
                     f"{summary['other_count']} Other States × ${fee['standard_rate']}) "
                     f"÷ {summary['enrolled_count']} ≈ ${fee['peepm']:.2f} PEEPM"
                 )
-                st.caption("The total enrolled count determines the pricing tier. The blended rate is rounded to the nearest $0.50 after calculation; halfway values round up.")
+                st.caption("The total enrolled count determines the pricing tier. The blended rate is rounded up to the next $0.50 increment after calculation. Rates already at a $0.50 increment remain unchanged.")
             elif summary["enrolled_count"] >= 9:
                 st.text("9–49 enrolled employees: $28 PEEPM in all states.")
             else:
