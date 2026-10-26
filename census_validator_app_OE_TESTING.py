@@ -15,7 +15,7 @@ headers with line breaks or parenthetical instructions.
 
 from __future__ import annotations
 
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_CEILING
 
 import csv
 import io
@@ -2242,7 +2242,7 @@ def _apply_vertical_inheritance(rows: list[dict[str, str]], fixes: list[dict[str
     _clear_dependent_employee_level_plan_fields(rows, fixes)
 
 
-def run_validation(df: pd.DataFrame, zip_cache: dict[str, dict[str, str]], *, source_label: str = "input", auto_fill_county: bool = False) -> dict[str, Any]:
+def run_validation(df: pd.DataFrame, zip_cache: dict[str, dict[str, str]], *, source_label: str = "input") -> dict[str, Any]:
     df = df.fillna("").astype(str).reset_index(drop=True)
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
@@ -2338,7 +2338,7 @@ def run_validation(df: pd.DataFrame, zip_cache: dict[str, dict[str, str]], *, so
                     continue
                 info = lookup_zip(zip_value, zip_cache)
                 if info:
-                    if auto_fill_county and not row.get(county_field, "").strip() and info.get("county"):
+                    if not row.get(county_field, "").strip() and info.get("county"):
                         row[county_field] = info["county"]
                         _append_issue(fixes, display_row, "—", county_field, "", "Auto-fix", f"County auto-filled from ZIP '{zip_value}': '{info['county']}'")
                 else:
@@ -2403,7 +2403,7 @@ def calculate_zizzl_fee(enrolled_count: int, aor_count: int) -> dict[str, Any]:
     aor_rate = 13 if enrolled_count >= 50 else standard_rate
     monthly_fee = Decimal(aor_count * aor_rate + other_count * standard_rate)
     peepm = (monthly_fee / (Decimal(enrolled_count) * Decimal("0.50"))).quantize(
-        Decimal("1"), rounding=ROUND_HALF_UP
+        Decimal("1"), rounding=ROUND_CEILING
     ) * Decimal("0.50")
     display_rate = f"{peepm:.2f}" if peepm != peepm.to_integral_value() else f"{peepm:.0f}"
     return {
@@ -2529,7 +2529,7 @@ def render_enrollment_fee_summary(census: pd.DataFrame) -> None:
                     f"{summary['other_count']} Other States × ${fee['standard_rate']}) "
                     f"÷ {summary['enrolled_count']} ≈ ${fee['peepm']:.2f} PEEPM"
                 )
-                st.caption("The total enrolled count determines the pricing tier. The blended rate is rounded to the nearest $0.50 after calculation; halfway values round up.")
+                st.caption("The total enrolled count determines the pricing tier. The blended rate is rounded up to the next $0.50 increment after calculation. Rates already at a $0.50 increment remain unchanged.")
             elif summary["enrolled_count"] >= 9:
                 st.text("9–49 enrolled employees: $28 PEEPM in all states.")
             else:
@@ -2633,7 +2633,7 @@ def _build_results(df_input: pd.DataFrame, input_mode: str, use_zip_lookup: bool
     sheet_detection = df_input.attrs.get("sheet_detection", [])
     workbook_sheet_count = df_input.attrs.get("workbook_sheet_count")
 
-    zip_cache = build_zip_cache() if ZIPCODES_AVAILABLE else {}
+    zip_cache = build_zip_cache() if (use_zip_lookup and ZIPCODES_AVAILABLE) else {}
     horizontal_detected, detect_reason = detect_horizontal_census(df_input)
     force_horizontal = input_mode == "Horizontal dependent census"
     force_vertical = input_mode == "Standard vertical census"
@@ -2651,7 +2651,7 @@ def _build_results(df_input: pd.DataFrame, input_mode: str, use_zip_lookup: bool
         conversion_summary = conversion
         source_label = "horizontal dependent census"
 
-    results = run_validation(validation_input, zip_cache, source_label=source_label, auto_fill_county=use_zip_lookup)
+    results = run_validation(validation_input, zip_cache, source_label=source_label)
     reformatted_df = results["reformatted_df"]
     results["valid_df"] = reformatted_df.iloc[results["valid_positions"]].reset_index(drop=True)
     results["error_df"] = reformatted_df.iloc[results["error_positions"]].reset_index(drop=True)
@@ -2690,7 +2690,7 @@ def main() -> None:
             index=0,
             help="Auto-detect now treats verbose vertical relationship headers correctly.",
         )
-        use_zip_lookup = st.toggle("Auto-fill County from ZIP", value=False, disabled=not ZIPCODES_AVAILABLE)
+        use_zip_lookup = st.toggle("Auto-fill County from ZIP", value=ZIPCODES_AVAILABLE, disabled=not ZIPCODES_AVAILABLE)
         if not ZIPCODES_AVAILABLE:
             st.caption("Install the zipcodes package to enable county auto-fill.")
 
