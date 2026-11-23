@@ -15,6 +15,8 @@ headers with line breaks or parenthetical instructions.
 
 from __future__ import annotations
 
+from decimal import Decimal, ROUND_CEILING
+
 import csv
 import io
 import re
@@ -1369,10 +1371,27 @@ def build_horizontal_column_map(df: pd.DataFrame) -> HorizontalColumnMap:
     )
     cm.plan_tier = cm.plan_tier_cols[0] if cm.plan_tier_cols else None
 
-    cm.oop_single = _pick_col(df, ["Current Health Plan OOP (single)", "Medical OOP Single", "OOP Single"], health_only=True)
-    cm.oop_family = _pick_col(df, ["Current Health Plan OOP (family)", "Medical OOP Family", "OOP Family"], health_only=True)
-    cm.ded_single = _pick_col(df, ["Current Health Plan Deductible (single)", "Medical Deductible Single", "Deductible Single"], health_only=True)
-    cm.ded_family = _pick_col(df, ["Current Health Plan Deductible (family)", "Medical Deductible Family", "Deductible Family"], health_only=True)
+    # Require both the benefit and its coverage level before assigning a numeric field.
+    def benefit_column(benefit: str, level: str) -> Optional[str]:
+        canonical = f"Current Health Plan {benefit} ({level})"
+        aliases = [canonical, f"Medical {benefit} {level}", f"{benefit} {level}"]
+        exact = _pick_col(df, aliases, allow_contains=False, allow_fuzzy=False)
+        if exact:
+            return exact
+        for header in df.columns:
+            words = _norm(header).split()
+            if _is_ancillary_header(header) or _is_actual_dependent_header(header):
+                continue
+            if {level} != {"single", "family"}.intersection(words):
+                continue
+            if benefit.lower() in words or (benefit == "OOP" and "out of pocket" in " ".join(words)):
+                return header
+        return None
+
+    cm.oop_single = benefit_column("OOP", "single")
+    cm.oop_family = benefit_column("OOP", "family")
+    cm.ded_single = benefit_column("Deductible", "single")
+    cm.ded_family = benefit_column("Deductible", "family")
     cm.er_cost = _pick_col(df, ["Current Health Plan ER Cost", "Medical ER Cost", "Employer Cost", "Pending Employer Cost", "Employer Contribution"], health_only=True, allow_fuzzy=False)
     cm.ee_cost = _pick_col(df, ["Current Health Plan EE Cost", "Medical EE Cost", "Employee Cost", "Pending Employee Cost", "Employee Contribution"], health_only=True, allow_fuzzy=False)
     cm.annual_salary = _pick_col(df, ["ANNUAL SALARY", "Annual Salary", "Salary", "Base Salary", "Annual Base Salary"])
@@ -2240,7 +2259,7 @@ def _apply_vertical_inheritance(rows: list[dict[str, str]], fixes: list[dict[str
     _clear_dependent_employee_level_plan_fields(rows, fixes)
 
 
-def run_validation(df: pd.DataFrame, zip_cache: dict[str, dict[str, str]], *, source_label: str = "input") -> dict[str, Any]:
+def run_validation(df: pd.DataFrame, zip_cache: dict[str, dict[str, str]], *, source_label: str = "input", auto_fill_county: bool = False) -> dict[str, Any]:
     df = df.fillna("").astype(str).reset_index(drop=True)
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
@@ -2336,7 +2355,7 @@ def run_validation(df: pd.DataFrame, zip_cache: dict[str, dict[str, str]], *, so
                     continue
                 info = lookup_zip(zip_value, zip_cache)
                 if info:
-                    if not row.get(county_field, "").strip() and info.get("county"):
+                    if auto_fill_county and not row.get(county_field, "").strip() and info.get("county"):
                         row[county_field] = info["county"]
                         _append_issue(fixes, display_row, "—", county_field, "", "Auto-fix", f"County auto-filled from ZIP '{zip_value}': '{info['county']}'")
                 else:
@@ -2370,6 +2389,186 @@ def run_validation(df: pd.DataFrame, zip_cache: dict[str, dict[str, str]], *, so
         "unrecognized_cols": unrecognized_cols,
         "source_label": source_label,
     }
+
+
+# =============================================================================
+# ENROLLED EMPLOYEE STATE SUMMARY AND ZIZZL FEE MODEL
+# =============================================================================
+
+AOR_STATES = {
+    "GA": "Georgia", "IL": "Illinois", "IN": "Indiana", "TX": "Texas",
+    "MN": "Minnesota", "PA": "Pennsylvania", "WI": "Wisconsin", "CO": "Colorado",
+}
+
+
+def calculate_zizzl_fee(enrolled_count: int, aor_count: int) -> dict[str, Any]:
+    """Select the tier by total enrolled employees, then blend before rounding."""
+    if enrolled_count < 0 or not 0 <= aor_count <= enrolled_count:
+        raise ValueError("Counts must satisfy 0 <= AOR count <= enrolled count.")
+    other_count = enrolled_count - aor_count
+    if enrolled_count < 9:
+        return {
+            "label": "$250 Flat Admin Fee", "monthly_fee": Decimal("250"),
+            "peepm": None, "aor_rate": None, "standard_rate": None,
+            "free_aca": False,
+        }
+    standard_rate = next(
+        rate for upper, rate in [(50, 28), (100, 28), (200, 26), (300, 25),
+                                (400, 24), (500, 23), (float("inf"), 20)]
+        if enrolled_count < upper
+    )
+    aor_rate = 13 if enrolled_count >= 50 else standard_rate
+    monthly_fee = Decimal(aor_count * aor_rate + other_count * standard_rate)
+    peepm = (monthly_fee / (Decimal(enrolled_count) * Decimal("0.50"))).quantize(
+        Decimal("1"), rounding=ROUND_CEILING
+    ) * Decimal("0.50")
+    peepm = max(Decimal("20.00"), peepm)
+    display_rate = f"{peepm:.2f}" if peepm != peepm.to_integral_value() else f"{peepm:.0f}"
+    return {
+        "label": f"${display_rate} PEEPM", "monthly_fee": monthly_fee,
+        "peepm": peepm, "aor_rate": aor_rate, "standard_rate": standard_rate,
+        "free_aca": enrolled_count >= 50,
+    }
+
+
+def build_enrollment_fee_summary(
+    census: pd.DataFrame, zip_cache: dict[str, dict[str, str]]
+) -> dict[str, Any]:
+    """Use all reformatted employee rows, including rows with validation errors.
+
+    Home ZIP alone determines AOR eligibility. Unknown ZIPs receive no discount
+    and remain in Other States, explicitly flagged for review by the UI.
+    """
+    columns = ["First Name", "Last Name", "Relationship", "Health Election", "Zip Code"]
+    data = census.reindex(columns=columns).fillna("")
+    counts = {abbr: 0 for abbr in AOR_STATES}
+    total = other_count = unknown_count = unresolved_count = 0
+    unmatched_employees = []
+
+    for position, row in enumerate(data.to_dict("records")):
+        relationship = normalize_relationship(row["Relationship"])[0]
+        election = normalize_election(row["Health Election"])[0]
+        if relationship not in {"Employee", "Spouse", "Child"}:
+            unresolved_count += 1
+        if relationship != "Employee":
+            continue
+        if election not in {"Enroll", "Waive"}:
+            unresolved_count += 1
+
+        home_zip = _pad_zip(row["Zip Code"])
+        info = zip_cache.get(home_zip) if re.fullmatch(r"\d{5}", home_zip) else None
+        state = str((info or {}).get("abbr", "")).strip().upper()
+        matched = state in SUPPORTED_ZIP_STATES
+        is_enrolled = election == "Enroll"
+
+        if not matched:
+            if not home_zip:
+                issue = "Missing home ZIP"
+            elif not re.fullmatch(r"\d{5}", home_zip):
+                issue = "Invalid U.S. ZIP format"
+            elif home_zip in KNOWN_INVALID_OR_UNSUPPORTED_ZIPS:
+                issue = "Unsupported home ZIP"
+            elif not zip_cache:
+                issue = "ZIP lookup unavailable"
+            else:
+                issue = "Home ZIP not matched to a supported state"
+            unmatched_employees.append({
+                "Reformatted CSV Row": position + 2,
+                "First Name": row["First Name"],
+                "Last Name": row["Last Name"],
+                "Home ZIP Code": str(row["Zip Code"]),
+                "Health Election": election or "Missing",
+                "Issue": issue,
+                "Included in Fee": "Yes" if is_enrolled else "No",
+            })
+
+        if is_enrolled:
+            total += 1
+            if state in AOR_STATES:
+                counts[state] += 1
+            else:
+                other_count += 1
+                unknown_count += int(not matched)
+
+    state_rows = [
+        {"Home State": name, "Enrolled Employees": counts[abbr]}
+        for abbr, name in AOR_STATES.items()
+    ]
+    state_rows.append({"Home State": "Other States", "Enrolled Employees": other_count})
+    aor_count = sum(counts.values())
+    return {
+        "state_rows": state_rows, "enrolled_count": total, "aor_count": aor_count,
+        "other_count": other_count, "unknown_zip_count": unknown_count,
+        "unresolved_count": unresolved_count,
+        "unmatched_employees": unmatched_employees,
+        "lookup_available": bool(zip_cache),
+        "fee": calculate_zizzl_fee(total, aor_count),
+    }
+
+
+def render_enrollment_fee_summary(census: pd.DataFrame) -> None:
+    """An isolated, opt-in panel; does not mutate census or validation results."""
+    with st.expander("Enrolled employee summary & zizzl pricing", expanded=False):
+        # Independent of county auto-fill; reuse the existing cached ZIP lookup.
+        summary = build_enrollment_fee_summary(census, build_zip_cache())
+        fee = summary["fee"]
+        st.caption("Based on enrolled employees and home ZIP codes. Dependents and waived employees are excluded from pricing.")
+        columns = st.columns(3)
+        columns[0].metric("Enrolled employees", summary["enrolled_count"])
+        columns[1].metric("AOR states", summary["aor_count"])
+        columns[2].metric("Other States", summary["other_count"])
+        st.dataframe(
+            pd.DataFrame(summary["state_rows"]),
+            use_container_width=True, hide_index=True, height=353,
+        )
+
+        # Metrics and plain text prevent dollar signs from being parsed as math.
+        st.metric("zizzl fee / PEEPM", fee["label"])
+        if fee["free_aca"]:
+            st.success("Free ACA included")
+        if not summary["lookup_available"]:
+            st.warning("Home-state lookup is unavailable. Pricing is provisional until ZIP lookup is restored.")
+        if summary["unknown_zip_count"]:
+            st.warning(
+                f"{summary['unknown_zip_count']} enrolled employee(s) have unverified home ZIP codes. "
+                "They are included in Other States without an AOR discount. "
+                "Correct the ZIP codes and validate again to confirm pricing."
+            )
+        if summary["unresolved_count"]:
+            st.warning(
+                f"{summary['unresolved_count']} row(s) have unresolved relationships or employee elections. "
+                "Review the validation report to confirm the enrolled count and pricing tier."
+            )
+
+        if st.checkbox("Show fee calculation details", key="fee_show_calculation_details"):
+            if summary["enrolled_count"] >= 50:
+                st.text(
+                    f"({summary['aor_count']} AOR × $13 + "
+                    f"{summary['other_count']} Other States × ${fee['standard_rate']}) "
+                    f"÷ {summary['enrolled_count']} → Applied rate: ${fee['peepm']:.2f} PEEPM"
+                )
+                st.caption("The total enrolled count determines the pricing tier. The blended rate is rounded up to the next $0.50 increment, with a minimum of $20 PEEPM. Rates already at a $0.50 increment remain unchanged unless below the minimum.")
+            elif summary["enrolled_count"] >= 9:
+                st.text("9–49 enrolled employees: $28 PEEPM in all states.")
+            else:
+                st.text("0–8 enrolled employees: $250 flat monthly admin fee.")
+            st.caption("AOR discounts and Free ACA begin at 50 enrolled employees. Counts use the full reformatted census, including employees with validation errors.")
+
+        unmatched = summary["unmatched_employees"]
+        if unmatched:
+            st.markdown(f"**Employees with unmatched home ZIP codes ({len(unmatched)})**")
+            st.caption("Includes enrolled and waived employees. Row numbers reference the full reformatted CSV, with the header as row 1.")
+            unmatched_df = pd.DataFrame(unmatched)
+            st.dataframe(
+                unmatched_df, use_container_width=True, hide_index=True,
+                height=min(388, 38 + 35 * len(unmatched_df)),
+            )
+            st.download_button(
+                "Download unmatched ZIP list", data=df_to_csv_bytes(unmatched_df),
+                file_name="employees_unmatched_home_zips.csv", mime="text/csv",
+                key="fee_unmatched_home_zip_download",
+                use_container_width=True,
+            )
 
 
 # =============================================================================
@@ -2452,7 +2651,7 @@ def _build_results(df_input: pd.DataFrame, input_mode: str, use_zip_lookup: bool
     sheet_detection = df_input.attrs.get("sheet_detection", [])
     workbook_sheet_count = df_input.attrs.get("workbook_sheet_count")
 
-    zip_cache = build_zip_cache() if (use_zip_lookup and ZIPCODES_AVAILABLE) else {}
+    zip_cache = build_zip_cache() if ZIPCODES_AVAILABLE else {}
     horizontal_detected, detect_reason = detect_horizontal_census(df_input)
     force_horizontal = input_mode == "Horizontal dependent census"
     force_vertical = input_mode == "Standard vertical census"
@@ -2470,7 +2669,7 @@ def _build_results(df_input: pd.DataFrame, input_mode: str, use_zip_lookup: bool
         conversion_summary = conversion
         source_label = "horizontal dependent census"
 
-    results = run_validation(validation_input, zip_cache, source_label=source_label)
+    results = run_validation(validation_input, zip_cache, source_label=source_label, auto_fill_county=use_zip_lookup)
     reformatted_df = results["reformatted_df"]
     results["valid_df"] = reformatted_df.iloc[results["valid_positions"]].reset_index(drop=True)
     results["error_df"] = reformatted_df.iloc[results["error_positions"]].reset_index(drop=True)
@@ -2509,7 +2708,7 @@ def main() -> None:
             index=0,
             help="Auto-detect now treats verbose vertical relationship headers correctly.",
         )
-        use_zip_lookup = st.toggle("Auto-fill County from ZIP", value=ZIPCODES_AVAILABLE, disabled=not ZIPCODES_AVAILABLE)
+        use_zip_lookup = st.toggle("Auto-fill County from ZIP", value=False, disabled=not ZIPCODES_AVAILABLE)
         if not ZIPCODES_AVAILABLE:
             st.caption("Install the zipcodes package to enable county auto-fill.")
 
@@ -2697,6 +2896,9 @@ def main() -> None:
     st.divider()
     with st.expander("Preview reformatted output", expanded=False):
         st.dataframe(reformatted_df, use_container_width=True, hide_index=True)
+
+
+    render_enrollment_fee_summary(reformatted_df)
 
 
 if __name__ == "__main__":
